@@ -13,7 +13,7 @@ from PIL import Image
 from app.vision.occupancy import SlotOccupancyEngine
 
 from app.parking.state_manager import ParkingStateManager
-from app.vision.detector import VehicleDetector
+from app.vision.detector import VehicleDetector, get_detector
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class ParkingService:
     def __init__(self) -> None:
         self.state_manager = ParkingStateManager()
-        self.detector = VehicleDetector(model_name="yolov8n.pt", camera_id="CAM_01")
+        self.detector = get_detector()
         self.camera_active: bool = False
         self.camera_cap: cv2.VideoCapture | None = None
         self.last_frame_annotated_b64: str | None = None
@@ -203,5 +203,20 @@ class ParkingService:
             "occupancy_pct": overview["occupancy_pct"],
         }
 
+    def get_sections(self) -> list[dict[str, Any]]:
+        sections: dict[str, dict[str, Any]] = {}
+        for slot in self.state_manager.get_slots():
+            sec = slot.get("section_id", "A")
+            if sec not in sections:
+                sections[sec] = {"section_id": sec, "total": 0, "available": 0, "occupied": 0}
+            sections[sec]["total"] += 1
+            if slot.get("status") == "AVAILABLE":
+                sections[sec]["available"] += 1
+            elif slot.get("status") == "OCCUPIED":
+                sections[sec]["occupied"] += 1
+        return list(sections.values())
+
+
 
 parking_service = ParkingService()
+

@@ -4,6 +4,7 @@ import base64
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import threading
 from typing import Any
 import cv2
 import numpy as np
@@ -35,13 +36,26 @@ class VehicleDetection:
 
 
 class VehicleDetector:
-    """YOLOv8-powered real-time vehicle detector."""
+    """YOLOv8-powered real-time vehicle detector (Thread-safe Singleton)."""
+
+    _instance: VehicleDetector | None = None
+    _lock: threading.Lock = threading.Lock()
+
+    def __new__(cls, model_name: str = "yolov8n.pt", camera_id: str = "CAM_01") -> VehicleDetector:
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
 
     def __init__(self, model_name: str = "yolov8n.pt", camera_id: str = "CAM_01") -> None:
+        if getattr(self, "_initialized", False):
+            return
         self.camera_id = camera_id
         self.model_name = model_name
         self.model = None
         self._load_model()
+        self._initialized = True
 
     def _load_model(self) -> None:
         try:
@@ -49,7 +63,7 @@ class VehicleDetector:
             self.model = YOLO(self.model_name)
             logger.info("Successfully loaded YOLO model: %s", self.model_name)
         except Exception as exc:
-            logger.warning("Could not load YOLO model (%s). Will use simulated detector: %s", self.model_name, exc)
+            logger.warning("Could not load YOLO model (%s). Will use fallback/simulated mode: %s", self.model_name, exc)
             self.model = None
 
     def detect(self, frame: np.ndarray, conf_threshold: float = 0.15) -> list[VehicleDetection]:
@@ -152,3 +166,12 @@ class VehicleDetector:
             return ""
         encoded = base64.b64encode(buffer).decode("utf-8")
         return f"data:image/jpeg;base64,{encoded}"
+
+
+# Global persistent singleton instance for reuse across endpoints
+global_detector = VehicleDetector()
+
+
+def get_detector() -> VehicleDetector:
+    """Helper function to get the global singleton VehicleDetector instance."""
+    return global_detector

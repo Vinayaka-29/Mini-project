@@ -167,3 +167,19 @@ class ParkingStateManager:
             "issued_at": datetime.now(timezone.utc).isoformat(),
             "qr_code_data": f"AI-PARK:PASS:{vehicle_id}:{slot_id}",
         }
+
+    def get_allocations(self) -> dict[str, str]:
+        return self.allocations
+
+    def get_vehicles(self) -> list[dict[str, Any]]:
+        vehicles = []
+        for slot in self.slots.values():
+            if slot.get("vehicle_id"):
+                vehicles.append({
+                    "vehicle_id": slot["vehicle_id"],
+                    "slot_id": slot["slot_id"],
+                    "status": slot["status"],
+                    "since": slot.get("occupied_since") or slot.get("reserved_since"),
+                })
+        return vehicles
+
