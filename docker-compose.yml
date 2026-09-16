@@ -12,5 +12,6 @@ services:
       - APP_VERSION=1.0.0
       - ENV_STATE=production
     volumes:
-      - ./configs:/app/configs:ro
+      - ./configs:/app/configs
     restart: unless-stopped
+

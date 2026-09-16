@@ -136,54 +136,61 @@ async def detect_image(file: UploadFile = File(...)):
     2. Runs YOLOv8 vehicle detection in worker threadpool.
     3. Calculates spot availability using IoU and Point-in-Polygon occupancy engine.
     4. Saves state and returns updated parking lot state.
-    5. Gracefully catches inference / OOM errors and returns 500 JSON without crashing.
+    5. Returns 400 for corrupted images and preserves existing slot state on unexpected 500 errors.
     """
+    if not file:
+        raise HTTPException(status_code=400, detail="No image file provided")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty image file received")
+
+    def pipeline(img_bytes: bytes) -> dict[str, Any]:
+        # 1. Convert bytes to OpenCV image
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Could not decode image from uploaded bytes (invalid or corrupted image)")
+
+        # 2. Get global detector & find cars
+        detector = get_detector()
+        detections = detector.detect(frame)
+
+        # 3. Calculate intersections
+        current_slots = list(parking_service.state_manager.slots.values())
+        h, w = frame.shape[:2]
+        updated = global_occupancy_engine.map_detections_to_spots(
+            slots=current_slots, detections=detections, image_shape=(h, w)
+        )
+
+        # 4. Save state
+        for spot in updated:
+            parking_service.state_manager.update_slot_status(spot["slot_id"], spot["status"])
+
+        # 5. Return updated lot
+        return {
+            "slots": parking_service.state_manager.get_slots(),
+            "overview": parking_service.state_manager.get_overview(),
+            "detections": [d.to_dict() if hasattr(d, "to_dict") else d for d in detections],
+            "total_detected_vehicles": len(detections),
+        }
+
     try:
-        content = await file.read()
-        if not content:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Empty image file received", "slots": []},
-            )
-
-        def pipeline(img_bytes: bytes) -> dict[str, Any]:
-            # 1. Convert bytes to OpenCV image
-            np_arr = np.frombuffer(img_bytes, np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            if frame is None:
-                raise ValueError("Could not decode image from uploaded bytes")
-
-            # 2. Get global detector & find cars
-            detector = get_detector()
-            detections = detector.detect(frame)
-
-            # 3. Calculate intersections
-            current_slots = list(parking_service.state_manager.slots.values())
-            h, w = frame.shape[:2]
-            updated = global_occupancy_engine.map_detections_to_spots(
-                slots=current_slots, detections=detections, image_shape=(h, w)
-            )
-
-            # 4. Save state
-            for spot in updated:
-                parking_service.state_manager.update_slot_status(spot["slot_id"], spot["status"])
-
-            # 5. Return updated lot
-            return {
-                "slots": parking_service.state_manager.get_slots(),
-                "overview": parking_service.state_manager.get_overview(),
-                "detections": [d.to_dict() if hasattr(d, "to_dict") else d for d in detections],
-                "total_detected_vehicles": len(detections),
-            }
-
         return await run_in_threadpool(pipeline, content)
-
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("Inference execution failed: %s", exc, exc_info=True)
         return JSONResponse(
             status_code=500,
-            content={"error": "Inference failed", "detail": str(exc), "slots": []},
+            content={
+                "error": "Inference failed",
+                "detail": str(exc),
+                "slots": parking_service.state_manager.get_slots(),
+                "overview": parking_service.state_manager.get_overview(),
+            },
         )
+
 
 
 @router.post("/camera/toggle")

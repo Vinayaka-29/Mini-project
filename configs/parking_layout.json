@@ -2,23 +2,49 @@
   "camera_id": "CAM_01",
   "section_id": "A",
   "slots": [
-    {"slot_id": "A01", "section_id": "A", "camera_id": "CAM_01", "polygon": [[100, 60], [180, 60], [180, 120], [100, 120]], "status": "AVAILABLE", "type": "STANDARD", "priority": 1, "distance_from_entries": 10},
-    {"slot_id": "A02", "section_id": "A", "camera_id": "CAM_01", "polygon": [[190, 60], [270, 60], [270, 120], [190, 120]], "status": "AVAILABLE", "type": "STANDARD", "priority": 1, "distance_from_entries": 12},
-    {"slot_id": "A03", "section_id": "A", "camera_id": "CAM_01", "polygon": [[280, 60], [360, 60], [360, 120], [280, 120]], "status": "AVAILABLE", "type": "STANDARD", "priority": 1, "distance_from_entries": 14},
-    {"slot_id": "A04", "section_id": "A", "camera_id": "CAM_01", "polygon": [[370, 60], [450, 60], [450, 120], [370, 120]], "status": "AVAILABLE", "type": "STANDARD", "priority": 1, "distance_from_entries": 16},
-    {"slot_id": "B01", "section_id": "B", "camera_id": "CAM_01", "polygon": [[100, 180], [180, 180], [180, 240], [100, 240]], "status": "AVAILABLE", "type": "STANDARD", "priority": 2, "distance_from_entries": 20},
-    {"slot_id": "B02", "section_id": "B", "camera_id": "CAM_01", "polygon": [[190, 180], [270, 180], [270, 240], [190, 240]], "status": "AVAILABLE", "type": "STANDARD", "priority": 2, "distance_from_entries": 22},
-    {"slot_id": "B03", "section_id": "B", "camera_id": "CAM_01", "polygon": [[280, 180], [360, 180], [360, 240], [280, 240]], "status": "AVAILABLE", "type": "STANDARD", "priority": 2, "distance_from_entries": 24},
-    {"slot_id": "B04", "section_id": "B", "camera_id": "CAM_01", "polygon": [[370, 180], [450, 180], [450, 240], [370, 240]], "status": "AVAILABLE", "type": "STANDARD", "priority": 2, "distance_from_entries": 26}
-  ],
-  "entry_points": [
-    {"entry_id": "ENTRY_01", "x": 230, "y": 300},
-    {"entry_id": "ENTRY_02", "x": 360, "y": 300}
-  ],
-  "routes": [
-    {"from": "ENTRY_01", "to": "A01"},
-    {"from": "ENTRY_01", "to": "A02"},
-    {"from": "ENTRY_01", "to": "B01"},
-    {"from": "ENTRY_01", "to": "B02"}
+    {
+      "slot_id": "BAY_101",
+      "polygon": [
+        [
+          10,
+          10
+        ],
+        [
+          90,
+          10
+        ],
+        [
+          90,
+          90
+        ],
+        [
+          10,
+          90
+        ]
+      ],
+      "status": "AVAILABLE"
+    },
+    {
+      "slot_id": "BAY_102",
+      "polygon": [
+        [
+          100,
+          10
+        ],
+        [
+          180,
+          10
+        ],
+        [
+          180,
+          90
+        ],
+        [
+          100,
+          90
+        ]
+      ],
+      "status": "AVAILABLE"
+    }
   ]
 }

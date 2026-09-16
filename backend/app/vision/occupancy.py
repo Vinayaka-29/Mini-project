@@ -205,8 +205,9 @@ class SlotOccupancyEngine:
                 best_conf = conf
                 matched_det = det
 
-        is_occupied = (best_overlap >= active_threshold) or (best_iou >= 0.35) or (best_overlap >= 0.20 and best_conf > 0.40)
+        is_occupied = (best_overlap >= active_threshold) or (best_iou >= 0.40)
         status = "OCCUPIED" if is_occupied else "AVAILABLE"
+
         confidence = round(max(0.75, min(0.99, best_conf if is_occupied else (1.0 - min(1.0, best_overlap)))), 2)
 
         return {

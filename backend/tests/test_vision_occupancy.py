@@ -129,12 +129,12 @@ def test_dynamic_layout_api():
     assert "BAY_102" in slot_ids
 
 
-def test_image_upload_graceful_fallback():
-    """Verify corrupted / unparseable image upload returns 500 JSON without crashing the server."""
+def test_image_upload_corrupted_image_returns_400():
+    """Verify corrupted / unparseable image upload returns 400 HTTPException cleanly."""
     client = TestClient(app)
     corrupted_bytes = io.BytesIO(b"not_a_valid_image_header_bytes")
     response = client.post("/api/detect/image", files={"file": ("corrupt.jpg", corrupted_bytes, "image/jpeg")})
-    assert response.status_code == 500
+    assert response.status_code == 400
     data = response.json()
-    assert data["error"] == "Inference failed"
-    assert data["slots"] == []
+    assert "detail" in data
+
