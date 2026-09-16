@@ -16,11 +16,13 @@ class ParkingStateManager:
         self.last_analysis_time: str | None = None
         self.total_detections: int = 0
 
-    def load_layout(self, config: dict[str, Any]) -> None:
+    def load_layout(self, config: dict[str, Any] | list[dict[str, Any]]) -> None:
         self.slots = {}
-        for raw_slot in config.get("slots", []):
+        slot_list = config if isinstance(config, list) else config.get("slots", [])
+        for raw_slot in slot_list:
+            slot_id = str(raw_slot.get("slot_id") or raw_slot.get("id"))
             slot = {
-                "slot_id": raw_slot["slot_id"],
+                "slot_id": slot_id,
                 "section_id": raw_slot.get("section_id", "A"),
                 "camera_id": raw_slot.get("camera_id", "CAM_01"),
                 "polygon": raw_slot.get("polygon", []),
@@ -28,12 +30,23 @@ class ParkingStateManager:
                 "type": raw_slot.get("type", "STANDARD"),
                 "priority": raw_slot.get("priority", 1),
                 "distance_from_entries": raw_slot.get("distance_from_entries", 0),
-                "confidence": 0.98,
+                "confidence": float(raw_slot.get("confidence", 0.98)),
                 "occupied_since": None,
                 "reserved_since": None,
                 "vehicle_id": None,
             }
             self.slots[slot["slot_id"]] = slot
+
+    def update_layout(self, layout: dict[str, Any] | list[dict[str, Any]]) -> dict[str, Any]:
+        """Dynamically update parking spot polygons in memory."""
+        self.load_layout(layout)
+        return {
+            "status": "success",
+            "message": "Parking layout updated successfully",
+            "total_slots": len(self.slots),
+            "slots": self.get_slots(),
+        }
+
 
     def expire_reservations(self, max_minutes: int = 15) -> None:
         """Expire old reservations if not claimed within timeout."""

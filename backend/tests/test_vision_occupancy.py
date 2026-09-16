@@ -93,7 +93,7 @@ def test_detector_annotation_runs_smoothly():
 def test_image_upload_endpoint():
     """Verify non-blocking image upload endpoint processes image and returns updated parking lot state."""
     client = TestClient(app)
-    
+
     # Create test dummy image in memory
     img = Image.new("RGB", (640, 480), color=(73, 109, 137))
     buf = io.BytesIO()
@@ -106,3 +106,35 @@ def test_image_upload_endpoint():
     assert "slots" in data
     assert isinstance(data["slots"], list)
 
+
+def test_dynamic_layout_api():
+    """Verify POST /api/config/layout dynamically updates parking slots in memory."""
+    client = TestClient(app)
+    custom_layout = {
+        "slots": [
+            {"slot_id": "BAY_101", "polygon": [[10, 10], [90, 10], [90, 90], [10, 90]], "status": "AVAILABLE"},
+            {"slot_id": "BAY_102", "polygon": [[100, 10], [180, 10], [180, 90], [100, 90]], "status": "AVAILABLE"},
+        ]
+    }
+    response = client.post("/api/config/layout", json=custom_layout)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "success"
+    assert data["total_slots"] == 2
+
+    # Verify slots endpoint returns the new dynamic slots
+    slots_res = client.get("/api/slots")
+    slot_ids = [s["slot_id"] for s in slots_res.json()["slots"]]
+    assert "BAY_101" in slot_ids
+    assert "BAY_102" in slot_ids
+
+
+def test_image_upload_graceful_fallback():
+    """Verify corrupted / unparseable image upload returns 500 JSON without crashing the server."""
+    client = TestClient(app)
+    corrupted_bytes = io.BytesIO(b"not_a_valid_image_header_bytes")
+    response = client.post("/api/detect/image", files={"file": ("corrupt.jpg", corrupted_bytes, "image/jpeg")})
+    assert response.status_code == 500
+    data = response.json()
+    assert data["error"] == "Inference failed"
+    assert data["slots"] == []

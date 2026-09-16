@@ -142,6 +142,14 @@ class SlotOccupancyEngine:
         self.iou_threshold = iou_threshold
         self.default_slots: list[dict[str, Any]] = load_parking_layout(config_path)
 
+    def set_layout(self, slots: list[dict[str, Any]] | dict[str, Any]) -> None:
+        """Dynamically update the default slot definitions in memory."""
+        if isinstance(slots, dict):
+            self.default_slots = slots.get("slots", [])
+        else:
+            self.default_slots = list(slots)
+
+
     def compute_slot_status(
         self,
         slot: dict[str, Any],
