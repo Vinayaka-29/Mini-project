@@ -4,6 +4,7 @@ import base64
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 import threading
 from typing import Any
 import cv2
@@ -11,7 +12,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Vehicle classes in COCO: 2: car, 3: motorcycle, 5: bus, 7: truck
+# Vehicle classes in COCO dataset: 2: car, 3: motorcycle, 5: bus, 7: truck
 VEHICLE_CLASS_IDS = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
 
@@ -58,47 +59,85 @@ class VehicleDetector:
         self._initialized = True
 
     def _load_model(self) -> None:
+        """Explicitly locate and load YOLOv8 weights with critical error reporting."""
         try:
             from ultralytics import YOLO
-            self.model = YOLO(self.model_name)
-            logger.info("Successfully loaded YOLO model: %s", self.model_name)
+
+            # Check candidate local weight file locations
+            model_target = self.model_name
+            candidate_paths = [
+                Path.cwd() / self.model_name,
+                Path(__file__).resolve().parents[2] / self.model_name,
+                Path(__file__).resolve().parents[3] / self.model_name,
+            ]
+            for path in candidate_paths:
+                if path.exists():
+                    model_target = str(path)
+                    logger.info("Found local YOLO weights file at: %s", model_target)
+                    break
+
+            self.model = YOLO(model_target)
+            logger.info("Successfully loaded YOLO model: %s", model_target)
         except Exception as exc:
-            logger.warning("Could not load YOLO model (%s). Will use fallback/simulated mode: %s", self.model_name, exc)
+            logger.critical("CRITICAL: Failed to load YOLO model (%s): %s", self.model_name, exc, exc_info=True)
             self.model = None
 
-    def detect(self, frame: np.ndarray, conf_threshold: float = 0.15) -> list[VehicleDetection]:
-        """Detect vehicles in an image frame (BGR format) using YOLOv8."""
+    def detect(self, frame: np.ndarray, conf_threshold: float = 0.25) -> list[VehicleDetection]:
+        """
+        Detect vehicles in an image frame (converted to 3-channel BGR).
+        Runs YOLOv8 inference with explicit imgsz=640 and conf_threshold,
+        filtering strictly for vehicle classes (car, motorcycle, bus, truck).
+        """
         if frame is None or frame.size == 0:
             return []
 
+        # 1. Robust image preprocessing: ensure 3-channel BGR format
+        if len(frame.shape) == 2:
+            processed_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif len(frame.shape) == 3 and frame.shape[2] == 4:
+            processed_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        elif len(frame.shape) == 3 and frame.shape[2] == 1:
+            processed_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            processed_frame = frame
+
+        # 2. Ensure model is loaded
         if self.model is None:
             self._load_model()
+            if self.model is None:
+                logger.error("YOLO model unavailable for detection.")
+                return []
 
         detections: list[VehicleDetection] = []
 
-        if self.model is not None:
-            try:
-                results = self.model.predict(source=frame, conf=conf_threshold, imgsz=640, verbose=False)
-                if results and len(results) > 0:
-                    first_result = results[0]
-                    boxes = first_result.boxes
-                    if boxes is not None:
-                        for box in boxes:
-                            cls_id = int(box.cls[0].item()) if hasattr(box.cls[0], "item") else int(box.cls[0])
-                            if cls_id in VEHICLE_CLASS_IDS:
-                                conf = float(box.conf[0].item()) if hasattr(box.conf[0], "item") else float(box.conf[0])
-                                xyxy = box.xyxy[0].tolist() if hasattr(box.xyxy[0], "tolist") else list(box.xyxy[0])
-                                class_name = VEHICLE_CLASS_IDS.get(cls_id, "car")
-                                detections.append(
-                                    VehicleDetection(
-                                        class_name=class_name,
-                                        confidence=conf,
-                                        bbox=xyxy,
-                                        camera_id=self.camera_id,
-                                    )
+        try:
+            results = self.model.predict(
+                source=processed_frame,
+                conf=conf_threshold,
+                imgsz=640,
+                verbose=False,
+            )
+            if results and len(results) > 0:
+                first_result = results[0]
+                boxes = first_result.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        cls_id = int(box.cls[0].item()) if hasattr(box.cls[0], "item") else int(box.cls[0])
+                        # Filter strictly for vehicle classes
+                        if cls_id in VEHICLE_CLASS_IDS:
+                            conf = float(box.conf[0].item()) if hasattr(box.conf[0], "item") else float(box.conf[0])
+                            xyxy = box.xyxy[0].tolist() if hasattr(box.xyxy[0], "tolist") else list(box.xyxy[0])
+                            class_name = VEHICLE_CLASS_IDS.get(cls_id, "car")
+                            detections.append(
+                                VehicleDetection(
+                                    class_name=class_name,
+                                    confidence=conf,
+                                    bbox=xyxy,
+                                    camera_id=self.camera_id,
                                 )
-            except Exception as exc:
-                logger.error("YOLO detection error: %s", exc)
+                            )
+        except Exception as exc:
+            logger.error("YOLO detection execution error: %s", exc, exc_info=True)
 
         return detections
 
@@ -112,23 +151,19 @@ class VehicleDetector:
         annotated = frame.copy()
         h, w = annotated.shape[:2]
 
-        # Draw detected vehicle bounding boxes directly where cars are located
         for idx, det in enumerate(detections):
             bbox = det.bbox
             if len(bbox) < 4:
                 continue
             x1, y1, x2, y2 = [int(v) for v in bbox]
 
-            # High-tech neon bounding box
             color = (255, 0, 85) if idx % 2 == 0 else (0, 240, 255)  # Crimson / Cyan
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
 
-            # Draw transparent box highlight
             overlay = annotated.copy()
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
             cv2.addWeighted(overlay, 0.15, annotated, 0.85, 0, annotated)
 
-            # Tag label background
             tag = f"AI {det.class_name.upper()} {int(det.confidence * 100)}%"
             (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
             cv2.rectangle(annotated, (x1, max(0, y1 - 18)), (x1 + tw + 6, max(18, y1)), color, -1)
@@ -143,7 +178,6 @@ class VehicleDetector:
                 cv2.LINE_AA,
             )
 
-        # Futuristic HUD Header banner
         cv2.rectangle(annotated, (10, 10), (min(w - 10, 420), 44), (7, 10, 18), -1)
         cv2.rectangle(annotated, (10, 10), (min(w - 10, 420), 44), (0, 240, 255), 1)
         cv2.putText(

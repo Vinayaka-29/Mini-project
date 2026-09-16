@@ -4,7 +4,7 @@ import logging
 from typing import Any, Optional, Union
 import cv2
 import numpy as np
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -102,8 +102,8 @@ async def system() -> dict[str, Any]:
 @router.post("/config/layout")
 async def update_layout(payload: Union[LayoutUpdateRequest, dict[str, Any], list[dict[str, Any]]]) -> dict[str, Any]:
     """
-    Dynamically update parking spot polygons in memory.
-    Accepts new polygon coordinates from frontend or custom camera calibrations.
+    Dynamically update parking spot polygons in memory and disk.
+    Accepts new polygon coordinates from calibration tool or custom camera calibrations.
     """
     try:
         raw_layout: dict[str, Any] | list[dict[str, Any]]
@@ -114,8 +114,7 @@ async def update_layout(payload: Union[LayoutUpdateRequest, dict[str, Any], list
         else:
             raw_layout = payload.model_dump() if hasattr(payload, "model_dump") else (payload.dict() if hasattr(payload, "dict") else dict(payload))
 
-
-        # 1. Update state manager slots in memory
+        # 1. Update state manager slots in memory & disk
         result = parking_service.state_manager.update_layout(raw_layout)
 
         # 2. Update occupancy engine default slots
@@ -129,11 +128,14 @@ async def update_layout(payload: Union[LayoutUpdateRequest, dict[str, Any], list
 
 
 @router.post("/detect/image")
-async def detect_image(file: UploadFile = File(...)):
+async def detect_image(
+    file: UploadFile = File(...),
+    conf: float = Query(0.25, ge=0.01, le=1.0, description="YOLO detection confidence threshold"),
+):
     """
-    Non-blocking endpoint for uploaded image processing with graceful inference fallback:
+    Non-blocking endpoint for uploaded image processing with confidence tuning and graceful fallback:
     1. Receives uploaded image.
-    2. Runs YOLOv8 vehicle detection in worker threadpool.
+    2. Runs YOLOv8 vehicle detection with tuneable confidence threshold in worker threadpool.
     3. Calculates spot availability using IoU and Point-in-Polygon occupancy engine.
     4. Saves state and returns updated parking lot state.
     5. Returns 400 for corrupted images and preserves existing slot state on unexpected 500 errors.
@@ -152,9 +154,9 @@ async def detect_image(file: UploadFile = File(...)):
         if frame is None:
             raise ValueError("Could not decode image from uploaded bytes (invalid or corrupted image)")
 
-        # 2. Get global detector & find cars
+        # 2. Get global detector & find cars using specified confidence threshold
         detector = get_detector()
-        detections = detector.detect(frame)
+        detections = detector.detect(frame, conf_threshold=conf)
 
         # 3. Calculate intersections
         current_slots = list(parking_service.state_manager.slots.values())
@@ -173,6 +175,7 @@ async def detect_image(file: UploadFile = File(...)):
             "overview": parking_service.state_manager.get_overview(),
             "detections": [d.to_dict() if hasattr(d, "to_dict") else d for d in detections],
             "total_detected_vehicles": len(detections),
+            "confidence_threshold": conf,
         }
 
     try:
@@ -190,7 +193,6 @@ async def detect_image(file: UploadFile = File(...)):
                 "overview": parking_service.state_manager.get_overview(),
             },
         )
-
 
 
 @router.post("/camera/toggle")
