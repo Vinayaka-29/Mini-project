@@ -369,6 +369,15 @@ export default function App() {
             <span className="status-dot" />
             <span>{statusMsg}</span>
           </div>
+          <a
+            href="/calibration_tool.html"
+            target="_blank"
+            rel="noreferrer"
+            className="cyber-btn secondary"
+            style={{ padding: '6px 14px', fontSize: '12px', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+          >
+            <span>🎯</span> CALIBRATION STUDIO
+          </a>
         </div>
       </header>
 
