@@ -73,41 +73,54 @@ def calculate_polygon_bbox_overlap(
     bbox: list[float],
 ) -> tuple[float, float, bool]:
     """
-    Calculate intersection area, overlap ratio (intersection / slot_area), IoU,
-    and whether vehicle center falls inside the slot polygon.
+    Calculate intersection area using localized pixel masks, overlap ratio (intersection / slot_area),
+    IoU, and whether vehicle center falls inside the slot polygon.
     """
+    if len(polygon) < 3 or len(bbox) < 4:
+        return 0.0, 0.0, False
+
     vx1, vy1, vx2, vy2 = bbox
-    vehicle_poly = np.array(
-        [[vx1, vy1], [vx2, vy1], [vx2, vy2], [vx1, vy2]],
-        dtype=np.float32,
+
+    # Determine localized bounding dimensions to avoid creating a massive full-image mask
+    poly_xs = [float(p[0]) for p in polygon]
+    poly_ys = [float(p[1]) for p in polygon]
+
+    min_x = int(max(0, min(min(poly_xs), vx1)))
+    min_y = int(max(0, min(min(poly_ys), vy1)))
+    max_x = int(max(max(poly_xs), vx2)) + 2
+    max_y = int(max(max(poly_ys), vy2)) + 2
+
+    local_w = max(1, max_x - min_x)
+    local_h = max(1, max_y - min_y)
+
+    # 1. Create two localized blank np.uint8 masks
+    mask_poly = np.zeros((local_h, local_w), dtype=np.uint8)
+    mask_bbox = np.zeros((local_h, local_w), dtype=np.uint8)
+
+    # 2. Draw parking spot polygon on first mask (value 255)
+    local_poly = np.array(
+        [[int(round(px - min_x)), int(round(py - min_y))] for px, py in zip(poly_xs, poly_ys)],
+        dtype=np.int32,
     )
-    slot_np = np.array(polygon, dtype=np.float32)
+    cv2.fillPoly(mask_poly, [local_poly], 255)
 
-    # Compute slot area
-    slot_area = cv2.contourArea(slot_np)
+    # 3. Draw vehicle bounding box on second mask (value 255)
+    local_vx1 = int(round(max(0, vx1 - min_x)))
+    local_vy1 = int(round(max(0, vy1 - min_y)))
+    local_vx2 = int(round(max(0, vx2 - min_x)))
+    local_vy2 = int(round(max(0, vy2 - min_y)))
+    cv2.rectangle(mask_bbox, (local_vx1, local_vy1), (local_vx2, local_vy2), 255, -1)
+
+    # 4. Use bitwise_and to find exact overlapping pixels
+    intersection_mask = cv2.bitwise_and(mask_poly, mask_bbox)
+
+    # 5. Count non-zero pixels for intersection area
+    intersection_area = float(cv2.countNonZero(intersection_mask))
+    slot_area = float(cv2.countNonZero(mask_poly))
     if slot_area <= 0:
-        pxs = [p[0] for p in polygon]
-        pys = [p[1] for p in polygon]
-        slot_area = max(1.0, (max(pxs) - min(pxs)) * (max(pys) - min(pys)))
+        slot_area = max(1.0, (max(poly_xs) - min(poly_xs)) * (max(poly_ys) - min(poly_ys)))
 
-    vehicle_area = max(1.0, (vx2 - vx1) * (vy2 - vy1))
-
-    # Exact polygon intersection using OpenCV Convex intersection
-    try:
-        intersection_area, _ = cv2.intersectConvexConvex(slot_np, vehicle_poly)
-    except Exception:
-        # Fallback to axis-aligned bounding box intersection
-        pxs = [p[0] for p in polygon]
-        pys = [p[1] for p in polygon]
-        sx1, sy1, sx2, sy2 = min(pxs), min(pys), max(pxs), max(pys)
-        ix1 = max(sx1, vx1)
-        iy1 = max(sy1, vy1)
-        ix2 = min(sx2, vx2)
-        iy2 = min(sy2, vy2)
-        if ix2 > ix1 and iy2 > iy1:
-            intersection_area = (ix2 - ix1) * (iy2 - iy1)
-        else:
-            intersection_area = 0.0
+    vehicle_area = float(max(1.0, (vx2 - vx1) * (vy2 - vy1)))
 
     overlap_ratio = intersection_area / max(1.0, slot_area)
     union_area = max(1.0, slot_area + vehicle_area - intersection_area)
@@ -116,6 +129,7 @@ def calculate_polygon_bbox_overlap(
     # Center point in polygon check
     center_x = (vx1 + vx2) / 2.0
     center_y = (vy1 + vy2) / 2.0
+    slot_np = np.array(polygon, dtype=np.float32)
     center_in_poly = cv2.pointPolygonTest(slot_np, (center_x, center_y), False) >= 0
 
     return float(overlap_ratio), float(iou), bool(center_in_poly)
@@ -150,7 +164,6 @@ class SlotOccupancyEngine:
                 "iou": 0.0,
             }
 
-        # Convert normalized coordinates if needed
         poly: list[list[float]] = []
         if image_shape:
             h, w = image_shape
@@ -174,7 +187,6 @@ class SlotOccupancyEngine:
             conf = getattr(det, "confidence", 0.0) if hasattr(det, "confidence") else det.get("confidence", 0.0)
             overlap_ratio, iou, center_inside = calculate_polygon_bbox_overlap(poly, bbox)
 
-            # Combined score giving weight to overlap ratio and IoU
             score = overlap_ratio
             if center_inside:
                 score = max(score, 0.55)
@@ -185,10 +197,8 @@ class SlotOccupancyEngine:
                 best_conf = conf
                 matched_det = det
 
-        # Spot is OCCUPIED if overlap or IoU meets threshold or center point is inside with significant overlap
         is_occupied = (best_overlap >= active_threshold) or (best_iou >= 0.35) or (best_overlap >= 0.20 and best_conf > 0.40)
         status = "OCCUPIED" if is_occupied else "AVAILABLE"
-
         confidence = round(max(0.75, min(0.99, best_conf if is_occupied else (1.0 - min(1.0, best_overlap)))), 2)
 
         return {

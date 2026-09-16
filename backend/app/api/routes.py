@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Optional
+import cv2
+import numpy as np
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.services.parking_service import parking_service
+from app.vision.detector import get_detector
+from app.vision.occupancy import global_occupancy_engine
 
 logger = logging.getLogger(__name__)
 
@@ -80,30 +84,34 @@ async def system() -> dict[str, Any]:
 
 @router.post("/detect/image")
 async def detect_image(file: UploadFile = File(...)) -> dict[str, Any]:
-    """
-    Non-blocking endpoint for uploaded image processing:
-    1. Receives uploaded image asynchronously.
-    2. Runs YOLOv8 vehicle detection on worker threadpool via global VehicleDetector.
-    3. Calculates spot availability using IoU and Point-in-Polygon occupancy engine.
-    4. Updates parking state in state_manager.
-    5. Returns updated parking lot JSON state to the frontend.
-    """
-    if not file:
-        raise HTTPException(status_code=400, detail="No image file provided")
+    content = await file.read()
 
-    try:
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="Empty image file received")
+    def pipeline(img_bytes: bytes) -> dict[str, Any]:
+        # 1. Convert bytes to OpenCV image
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Could not decode image from uploaded bytes")
 
-        # Execute the CPU/GPU-bound computer vision pipeline on non-blocking threadpool
-        result = await run_in_threadpool(parking_service.process_image_upload, content)
-        return result
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Image detection failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Image detection failed: {str(exc)}") from exc
+        # 2. Get global detector & find cars
+        detector = get_detector()
+        detections = detector.detect(frame)
+
+        # 3. Calculate intersections
+        current_slots = list(parking_service.state_manager.slots.values())
+        h, w = frame.shape[:2]
+        updated = global_occupancy_engine.map_detections_to_spots(
+            slots=current_slots, detections=detections, image_shape=(h, w)
+        )
+
+        # 4. Save state
+        for spot in updated:
+            parking_service.state_manager.update_slot_status(spot["slot_id"], spot["status"])
+
+        # 5. Return updated lot
+        return {"slots": parking_service.state_manager.get_slots()}
+
+    return await run_in_threadpool(pipeline, content)
 
 
 @router.post("/camera/toggle")
