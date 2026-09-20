@@ -1,4 +1,8 @@
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+# Load .env variables first
+load_dotenv()
 
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware

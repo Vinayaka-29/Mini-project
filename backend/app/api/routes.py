@@ -11,7 +11,8 @@ from pydantic import BaseModel
 
 from app.services.parking_service import parking_service
 from app.vision.detector import get_detector
-from app.vision.occupancy import global_occupancy_engine
+from app.vision.occupancy import global_occupancy_engine, calculate_box_iou
+from app.vision.gemini_calibrator import calibrate_image
 
 logger = logging.getLogger(__name__)
 
@@ -257,3 +258,60 @@ async def simulate_event() -> dict[str, Any]:
 async def simulate_reset() -> dict[str, Any]:
     """Reset all parking bays to available."""
     return parking_service.reset_slots()
+
+
+@router.post("/detect/auto")
+async def detect_auto(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Auto-calibrate parking bays using Gemini and detect vehicle occupancy with YOLO."""
+    image_bytes = await file.read()
+
+    try:
+        bays = calibrate_image(image_bytes, mime_type=file.content_type or "image/jpeg")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"Calibration failed: {e}")
+
+    if not bays:
+        return {"bays": [], "vehicles": [], "message": "No parking bays detected in this image."}
+
+    # Decode image for YOLO detection
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Could not decode image")
+
+    h, w = frame.shape[:2]
+
+    # Run YOLO detection to find vehicles
+    detector = get_detector()
+    detector.set_detection_mode("yolo")  # Force YOLO mode for this endpoint
+    vehicle_detections = detector._detect_yolo(frame, conf_threshold=0.25)
+
+    # Convert vehicle detections to normalized boxes
+    vehicles = []
+    for det in vehicle_detections:
+        bbox = det.bbox
+        # Normalize to 0-1
+        norm_box = [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h]
+        vehicles.append({
+            "class": det.class_name,
+            "confidence": det.confidence,
+            "box": norm_box
+        })
+
+    # Match bays with vehicles using overlap
+    results = []
+    for bay in bays:
+        bx = bay["box"]
+        best_overlap = 0.0
+        for v in vehicles:
+            overlap = calculate_box_iou(bx, v["box"])
+            best_overlap = max(best_overlap, overlap)
+        status = "occupied" if best_overlap >= 0.4 else "free"
+        results.append({
+            "id": bay["id"],
+            "box": bx,
+            "status": status,
+            "overlap": round(best_overlap, 3)
+        })
+
+    return {"bays": results, "vehicles": vehicles}
