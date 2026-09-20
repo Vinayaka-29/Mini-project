@@ -35,7 +35,7 @@ def calibrate_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> list[d
     Raises ValueError if the response can't be parsed as valid bay data."""
 
     gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
-    gemini_model = "gemini-3.6-flash"
+    gemini_model = "gemini-3.5-flash"  # More stable than 3.6
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -47,17 +47,25 @@ def calibrate_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> list[d
                 {"inline_data": {"mime_type": mime_type, "data": b64}}
             ]
         }],
-        "generationConfig": {"temperature": 0}
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 8192
+        }
     }
 
-    # Retry logic for 503 errors
+    # Retry logic for 503 errors and timeouts
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            resp = requests.post(gemini_url, json=payload, timeout=30)
+            resp = requests.post(gemini_url, json=payload, timeout=60)  # Increased timeout
             resp.raise_for_status()
             data = resp.json()
             break
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise ValueError("Gemini API timed out after 3 retries. Try a smaller image.")
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 503 and attempt < max_retries - 1:
                 time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
