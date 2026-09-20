@@ -1,17 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react'
 import * as THREE from 'three'
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 
 export default function ThreeCarCanvas({ isRunning = true, carColor = '#00f0ff' }) {
   const mountRef = useRef(null)
   const [headlightsOn, setHeadlightsOn] = useState(true)
   const [nitroActive, setNitroActive] = useState(false)
-  const [modelLoading, setModelLoading] = useState(false)
   const carGroupRef = useRef(null)
   const wheelsRef = useRef([])
   const particlesRef = useRef(null)
   const lightsRef = useRef([])
-  const modelRef = useRef(null)
 
   useEffect(() => {
     const currentMount = mountRef.current
@@ -65,41 +62,6 @@ export default function ThreeCarCanvas({ isRunning = true, carColor = '#00f0ff' 
     const carGroup = new THREE.Group()
     carGroupRef.current = carGroup
     scene.add(carGroup)
-
-    // Use the supplied GT3 RS model when a valid GLB is available; keep the
-    // procedural car visible as a fallback while the asset loads or fails.
-    const modelLoader = new GLTFLoader()
-    setModelLoading(true)
-    modelLoader.load(
-      '/gt3rs.glb',
-      (gltf) => {
-        const model = gltf.scene
-        const bounds = new THREE.Box3().setFromObject(model)
-        const size = bounds.getSize(new THREE.Vector3())
-        const center = bounds.getCenter(new THREE.Vector3())
-        const largestDimension = Math.max(size.x, size.y, size.z) || 1
-        const scale = 7 / largestDimension
-
-        model.scale.setScalar(scale)
-        model.position.set(-center.x * scale, -bounds.min.y * scale, -center.z * scale)
-        model.traverse((child) => {
-          if (child.isMesh) {
-            child.castShadow = true
-            child.receiveShadow = true
-          }
-        })
-        scene.add(model)
-        modelRef.current = model
-        carGroup.visible = false
-        carGroupRef.current = model
-        setModelLoading(false)
-      },
-      undefined,
-      (error) => {
-        console.warn('GT3 RS GLB could not be loaded; using fallback car:', error)
-        setModelLoading(false)
-      },
-    )
 
     // Materials
     const bodyMaterial = new THREE.MeshStandardMaterial({
@@ -323,16 +285,6 @@ export default function ThreeCarCanvas({ isRunning = true, carColor = '#00f0ff' 
       if (currentMount && renderer.domElement) {
         currentMount.removeChild(renderer.domElement)
       }
-      if (modelRef.current) {
-        scene.remove(modelRef.current)
-        modelRef.current.traverse((child) => {
-          if (child.isMesh) {
-            child.geometry.dispose()
-            if (Array.isArray(child.material)) child.material.forEach((material) => material.dispose())
-            else child.material.dispose()
-          }
-        })
-      }
       renderer.dispose()
     }
   }, [isRunning, carColor, nitroActive])
@@ -351,7 +303,7 @@ export default function ThreeCarCanvas({ isRunning = true, carColor = '#00f0ff' 
       <div className="three-hud-overlay">
         <div className="hud-badge cyber-pulse">
           <span className="hud-dot" />
-          <span>{modelLoading ? 'LOADING 3D MODEL…' : 'AI-POWERED 3D CHASSIS TELEMETRY'}</span>
+          <span>AI-POWERED 3D CHASSIS TELEMETRY</span>
         </div>
         <div className="three-controls">
           <button
