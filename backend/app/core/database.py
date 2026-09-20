@@ -29,4 +29,11 @@ def get_db():
 def create_tables() -> None:
     """Create all database tables if they don't already exist."""
     from app.core import models  # noqa: F401 — import to register models
+    
+    # Ensure data directory exists for SQLite
+    if DATABASE_URL.startswith("sqlite:///"):
+        import os
+        db_path = DATABASE_URL.replace("sqlite:///", "")
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        
     Base.metadata.create_all(bind=engine)

@@ -128,7 +128,8 @@ def test_box_iou_no_overlap():
 
 def test_bg_detector_no_reference_returns_unknown():
     """Without a reference frame, each bay returns UNKNOWN."""
-    detector = ReferenceFrameDetector(reference_path="nonexistent_path.npy")
+    import uuid
+    detector = ReferenceFrameDetector(reference_path=f"missing_{uuid.uuid4()}.npy")
     slot = {
         "slot_id": "A1",
         "polygon": [[0.1, 0.1], [0.5, 0.1], [0.5, 0.5], [0.1, 0.5]],
@@ -137,10 +138,10 @@ def test_bg_detector_no_reference_returns_unknown():
     result = detector.detect_bay_occupancy(frame, slot, image_shape=(480, 640))
     assert result["status"] == "UNKNOWN"
 
-
 def test_bg_detector_empty_lot_is_available():
     """Set reference = current frame (empty lot) → all bays AVAILABLE."""
-    detector = ReferenceFrameDetector(reference_path="nonexistent_path.npy")
+    import uuid
+    detector = ReferenceFrameDetector(reference_path=f"temp_{uuid.uuid4()}.npy")
     frame = np.full((480, 640, 3), 80, dtype=np.uint8)  # uniform gray
     detector.set_reference(frame)
 
@@ -155,7 +156,8 @@ def test_bg_detector_empty_lot_is_available():
 
 def test_bg_detector_occupied_bay():
     """Draw a bright rectangle in the slot ROI → should be OCCUPIED."""
-    detector = ReferenceFrameDetector(reference_path="nonexistent_path.npy")
+    import uuid
+    detector = ReferenceFrameDetector(reference_path=f"temp_{uuid.uuid4()}.npy")
     reference = np.full((480, 640, 3), 60, dtype=np.uint8)
     detector.set_reference(reference)
 
@@ -176,71 +178,81 @@ def test_bg_detector_occupied_bay():
 # ── API endpoint tests ────────────────────────────────────────────────────────
 
 def test_health_endpoint():
-    client = TestClient(app)
-    response = client.get("/api/health")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert "detection_mode" in data
-    assert "bg_calibrated" in data
+    with TestClient(app) as client:
+        response = client.get("/api/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert "detection_mode" in data
+        assert "bg_calibrated" in data
 
 
 def test_slots_endpoint_returns_8_bays():
-    client = TestClient(app)
-    response = client.get("/api/slots")
-    assert response.status_code == 200
-    data = response.json()
-    assert "slots" in data
-    assert len(data["slots"]) == 8
+    with TestClient(app) as client:
+        response = client.get("/api/slots")
+        assert response.status_code == 200
+        data = response.json()
+        assert "slots" in data
+        assert len(data["slots"]) == 8
 
 
 def test_image_upload_endpoint():
-    client = TestClient(app)
-    img = Image.new("RGB", (640, 480), color=(73, 109, 137))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG")
-    buf.seek(0)
-    response = client.post("/api/detect/image", files={"file": ("test.jpg", buf, "image/jpeg")})
-    assert response.status_code == 200
-    data = response.json()
-    assert "slots" in data
-    assert "detection_mode" in data
+    with TestClient(app) as client:
+        img = Image.new("RGB", (640, 480), color=(73, 109, 137))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        buf.seek(0)
+        response = client.post("/api/detect/image", files={"file": ("test.jpg", buf, "image/jpeg")})
+        assert response.status_code == 200
+        data = response.json()
+        assert "slots" in data
+        assert "detection_mode" in data
 
 
 def test_reference_frame_endpoint():
     """POST /api/reference-frame accepts an image and returns success."""
-    client = TestClient(app)
-    img = Image.new("RGB", (640, 480), color=(60, 60, 60))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG")
-    buf.seek(0)
-    response = client.post("/api/reference-frame", files={"file": ("ref.jpg", buf, "image/jpeg")})
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "success"
-    assert data["has_reference"] is True
+    with TestClient(app) as client:
+        img = Image.new("RGB", (640, 480), color=(60, 60, 60))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        buf.seek(0)
+        response = client.post("/api/reference-frame", files={"file": ("ref.jpg", buf, "image/jpeg")})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+        assert data["has_reference"] is True
 
 
 def test_corrupted_image_returns_400():
-    client = TestClient(app)
-    bad = io.BytesIO(b"not_valid_image_bytes_xxxx")
-    response = client.post("/api/detect/image", files={"file": ("bad.jpg", bad, "image/jpeg")})
-    assert response.status_code == 400
+    with TestClient(app) as client:
+        bad = io.BytesIO(b"not_valid_image_bytes_xxxx")
+        response = client.post("/api/detect/image", files={"file": ("bad.jpg", bad, "image/jpeg")})
+        assert response.status_code == 400
 
 
 def test_dynamic_layout_update():
-    client = TestClient(app)
-    custom = {
-        "slots": [
-            {"slot_id": "A1", "polygon": [[0.05, 0.05], [0.30, 0.05], [0.30, 0.45], [0.05, 0.45]], "status": "AVAILABLE"},
-            {"slot_id": "A2", "polygon": [[0.35, 0.05], [0.60, 0.05], [0.60, 0.45], [0.35, 0.45]], "status": "AVAILABLE"},
-        ]
-    }
-    response = client.post("/api/config/layout", json=custom)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "success"
-    assert data["total_slots"] == 2
+    from app.services.parking_service import parking_service
+    import json
+    
+    with TestClient(app) as client:
+        # Save current layout
+        old_layout = parking_service.state_manager.get_slots()
+        
+        custom = {
+            "slots": [
+                {"slot_id": "A1", "polygon": [[0.05, 0.05], [0.30, 0.05], [0.30, 0.45], [0.05, 0.45]], "status": "AVAILABLE"},
+                {"slot_id": "A2", "polygon": [[0.35, 0.05], [0.60, 0.05], [0.60, 0.45], [0.35, 0.45]], "status": "AVAILABLE"},
+            ]
+        }
+        response = client.post("/api/config/layout", json=custom)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+        assert data["total_slots"] == 2
+        
+        # Restore layout
+        client.post("/api/config/layout", json={"slots": old_layout})
+
 
 
 def test_detector_annotation_runs():
