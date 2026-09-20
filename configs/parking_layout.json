@@ -1,50 +1,128 @@
 {
   "camera_id": "CAM_01",
   "section_id": "A",
+  "coordinate_system": "normalized",
+  "notes": "All polygon coordinates are normalized (0.0-1.0). Multiply by frame width/height at runtime. Re-calibrate using /calibration_tool.html on a real camera frame.",
   "slots": [
     {
-      "slot_id": "BAY_101",
+      "slot_id": "A1",
+      "section_id": "A",
+      "camera_id": "CAM_01",
+      "status": "AVAILABLE",
+      "type": "STANDARD",
+      "priority": 1,
+      "distance_from_entries": 8,
       "polygon": [
-        [
-          10,
-          10
-        ],
-        [
-          90,
-          10
-        ],
-        [
-          90,
-          90
-        ],
-        [
-          10,
-          90
-        ]
-      ],
-      "status": "AVAILABLE"
+        [0.06, 0.08],
+        [0.27, 0.08],
+        [0.27, 0.38],
+        [0.06, 0.38]
+      ]
     },
     {
-      "slot_id": "BAY_102",
+      "slot_id": "A2",
+      "section_id": "A",
+      "camera_id": "CAM_01",
+      "status": "AVAILABLE",
+      "type": "STANDARD",
+      "priority": 1,
+      "distance_from_entries": 12,
       "polygon": [
-        [
-          100,
-          10
-        ],
-        [
-          180,
-          10
-        ],
-        [
-          180,
-          90
-        ],
-        [
-          100,
-          90
-        ]
-      ],
-      "status": "AVAILABLE"
+        [0.28, 0.08],
+        [0.49, 0.08],
+        [0.49, 0.38],
+        [0.28, 0.38]
+      ]
+    },
+    {
+      "slot_id": "A3",
+      "section_id": "A",
+      "camera_id": "CAM_01",
+      "status": "AVAILABLE",
+      "type": "STANDARD",
+      "priority": 1,
+      "distance_from_entries": 16,
+      "polygon": [
+        [0.51, 0.08],
+        [0.72, 0.08],
+        [0.72, 0.38],
+        [0.51, 0.38]
+      ]
+    },
+    {
+      "slot_id": "A4",
+      "section_id": "A",
+      "camera_id": "CAM_01",
+      "status": "AVAILABLE",
+      "type": "STANDARD",
+      "priority": 1,
+      "distance_from_entries": 20,
+      "polygon": [
+        [0.73, 0.08],
+        [0.94, 0.08],
+        [0.94, 0.38],
+        [0.73, 0.38]
+      ]
+    },
+    {
+      "slot_id": "B1",
+      "section_id": "B",
+      "camera_id": "CAM_01",
+      "status": "AVAILABLE",
+      "type": "STANDARD",
+      "priority": 2,
+      "distance_from_entries": 22,
+      "polygon": [
+        [0.06, 0.55],
+        [0.27, 0.55],
+        [0.27, 0.85],
+        [0.06, 0.85]
+      ]
+    },
+    {
+      "slot_id": "B2",
+      "section_id": "B",
+      "camera_id": "CAM_01",
+      "status": "AVAILABLE",
+      "type": "STANDARD",
+      "priority": 2,
+      "distance_from_entries": 26,
+      "polygon": [
+        [0.28, 0.55],
+        [0.49, 0.55],
+        [0.49, 0.85],
+        [0.28, 0.85]
+      ]
+    },
+    {
+      "slot_id": "B3",
+      "section_id": "B",
+      "camera_id": "CAM_01",
+      "status": "AVAILABLE",
+      "type": "STANDARD",
+      "priority": 2,
+      "distance_from_entries": 30,
+      "polygon": [
+        [0.51, 0.55],
+        [0.72, 0.55],
+        [0.72, 0.85],
+        [0.51, 0.85]
+      ]
+    },
+    {
+      "slot_id": "B4",
+      "section_id": "B",
+      "camera_id": "CAM_01",
+      "status": "AVAILABLE",
+      "type": "STANDARD",
+      "priority": 2,
+      "distance_from_entries": 34,
+      "polygon": [
+        [0.73, 0.55],
+        [0.94, 0.55],
+        [0.94, 0.85],
+        [0.73, 0.85]
+      ]
     }
   ]
 }

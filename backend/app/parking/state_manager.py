@@ -29,6 +29,30 @@ class ParkingStateManager:
         self.occupancy_engine = SlotOccupancyEngine(iou_threshold=0.50)
         self.last_analysis_time: str | None = None
         self.total_detections: int = 0
+        # WebSocket broadcast callback injected by the WS layer
+        self._ws_broadcast_callback: Any | None = None
+
+    def set_ws_callback(self, callback: Any) -> None:
+        """Set a callback to broadcast state changes over WebSocket."""
+        self._ws_broadcast_callback = callback
+
+    def _notify_ws(self) -> None:
+        """Push current overview + slots to all WebSocket clients if callback is set."""
+        if self._ws_broadcast_callback is not None:
+            try:
+                import asyncio
+                payload = {
+                    "type": "STATE_UPDATE",
+                    "overview": self.get_overview_unlocked(),
+                    "slots": list(self.slots.values()),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                # Schedule the async broadcast from sync context
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(self._ws_broadcast_callback(payload))
+            except Exception as exc:
+                logger.debug("WS notify failed (non-critical): %s", exc)
 
     def load_layout(self, config: dict[str, Any] | list[dict[str, Any]]) -> None:
         with self._lock:
@@ -55,8 +79,6 @@ class ParkingStateManager:
     def update_layout(self, layout: dict[str, Any] | list[dict[str, Any]]) -> dict[str, Any]:
         """Dynamically update parking spot polygons in memory AND persist to disk."""
         self.load_layout(layout)
-
-        # Persist layout to disk
         self._persist_layout_to_disk(layout)
 
         with self._lock:
@@ -104,7 +126,13 @@ class ParkingStateManager:
                     except Exception:
                         pass
 
-    def update_slot_status(self, slot_id: str, status: str, confidence: float = 0.95, vehicle_id: str | None = None) -> None:
+    def update_slot_status(
+        self,
+        slot_id: str,
+        status: str,
+        confidence: float = 0.95,
+        vehicle_id: str | None = None,
+    ) -> None:
         with self._lock:
             if slot_id not in self.slots:
                 return
@@ -139,19 +167,24 @@ class ParkingStateManager:
                 "vehicle_id": vehicle_id,
             })
 
-    def process_vision_detections(self, detections: list[Any], image_shape: tuple[int, int] | None = None) -> dict[str, Any]:
-        """Apply vehicle detections to compute slot occupancy."""
+        # Push state change to WebSocket clients
+        self._notify_ws()
+
+    def process_vision_detections(
+        self,
+        detections: list[Any],
+        image_shape: tuple[int, int] | None = None,
+    ) -> dict[str, Any]:
+        """Apply vehicle detections to compute slot occupancy (YOLO path)."""
         with self._lock:
             self.last_analysis_time = datetime.now(timezone.utc).isoformat()
             self.total_detections = len(detections)
             slots_snapshot = [dict(s) for s in self.slots.values()]
 
-        updated_slots = []
         for slot in slots_snapshot:
             res = self.occupancy_engine.compute_slot_status(slot, detections, image_shape)
             new_status = res["status"]
             self.update_slot_status(slot["slot_id"], new_status, res["confidence"])
-            updated_slots.append(res)
 
         return self.get_overview()
 
@@ -164,8 +197,10 @@ class ParkingStateManager:
             current_status = self.slots[slot_id]["status"]
 
         new_status = "OCCUPIED" if current_status == "AVAILABLE" else "AVAILABLE"
-        vehicle_plate = f"KA-0{random.randint(1,9)}-{random.choice(['AI','CY','GT','MK'])}-{random.randint(1000, 9999)}" if new_status == "OCCUPIED" else None
-        
+        vehicle_plate = (
+            f"KA-0{random.randint(1,9)}-{random.choice(['AI','CY','GT','MK'])}-{random.randint(1000,9999)}"
+            if new_status == "OCCUPIED" else None
+        )
         self.update_slot_status(slot_id, new_status, round(random.uniform(0.92, 0.99), 2), vehicle_plate)
         return self.get_overview()
 
@@ -207,16 +242,27 @@ class ParkingStateManager:
 
     def get_recent_events(self) -> list[dict[str, Any]]:
         with self._lock:
-            return list(self.events[-15:])
+            return list(self.events[-50:])
 
-    def allocate_slot(self, vehicle_id: str, vehicle_type: str = "car") -> dict[str, Any]:
+    def allocate_slot(
+        self,
+        vehicle_id: str,
+        vehicle_type: str = "car",
+        preferred_slot_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Reserve a slot. Uses preferred_slot_id if provided (from AllocationEngine)."""
         self.expire_reservations()
         with self._lock:
             candidate = None
-            for slot in self.slots.values():
-                if slot["status"] == "AVAILABLE":
-                    if candidate is None or slot["distance_from_entries"] < candidate["distance_from_entries"]:
-                        candidate = slot
+            if preferred_slot_id and preferred_slot_id in self.slots:
+                s = self.slots[preferred_slot_id]
+                if s["status"] == "AVAILABLE":
+                    candidate = s
+            if candidate is None:
+                for slot in self.slots.values():
+                    if slot["status"] == "AVAILABLE":
+                        if candidate is None or slot["distance_from_entries"] < candidate["distance_from_entries"]:
+                            candidate = slot
             if candidate is None:
                 raise ValueError("Parking Full! No available slots currently.")
 
@@ -226,7 +272,7 @@ class ParkingStateManager:
             self.allocations[vehicle_id] = slot_id
 
         self.update_slot_status(slot_id, "RESERVED", 0.95, vehicle_id)
-        
+
         return {
             "ticket_id": f"TKT-{random.randint(10000, 99999)}",
             "vehicle_id": vehicle_id,

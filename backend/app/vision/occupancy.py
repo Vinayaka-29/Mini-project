@@ -39,6 +39,36 @@ def load_parking_layout(config_path: str | Path | None = None) -> list[dict[str,
     return []
 
 
+def _is_normalized(polygon: list[list[float]]) -> bool:
+    """Check if all polygon coordinates are in the normalized [0.0, 1.0] range."""
+    for pt in polygon:
+        for coord in pt:
+            if coord > 1.0:
+                return False
+    return True
+
+
+def scale_polygon(
+    raw_poly: list[list[float]],
+    image_shape: tuple[int, int] | None,
+) -> list[list[float]]:
+    """Scale normalized polygon coordinates to absolute pixel coordinates.
+
+    Polygons are stored as normalized (0.0-1.0) in the config.  If
+    ``image_shape`` is provided **and** the polygon looks normalized
+    (all coords ≤ 1.0), each point is multiplied by (w, h).  Otherwise
+    the polygon is returned as-is (already absolute).
+    """
+    if not raw_poly:
+        return raw_poly
+
+    if image_shape and _is_normalized(raw_poly):
+        h, w = image_shape
+        return [[float(pt[0]) * w, float(pt[1]) * h] for pt in raw_poly]
+
+    return [[float(pt[0]), float(pt[1])] for pt in raw_poly]
+
+
 def is_point_in_polygon(point: tuple[float, float] | list[float], polygon: list[list[float]]) -> bool:
     """Check if a 2D point (x, y) is inside or on the boundary of a polygon."""
     if len(polygon) < 3:
@@ -75,6 +105,8 @@ def calculate_polygon_bbox_overlap(
     """
     Calculate intersection area using localized pixel masks, overlap ratio (intersection / slot_area),
     IoU, and whether vehicle center falls inside the slot polygon.
+
+    Polygon coordinates must be in absolute pixels (already scaled).
     """
     if len(polygon) < 3 or len(bbox) < 4:
         return 0.0, 0.0, False
@@ -160,27 +192,26 @@ class SlotOccupancyEngine:
         """
         Determine if a single parking slot is OCCUPIED or AVAILABLE based on vehicle bounding boxes.
         Applies IoU and Point-in-Polygon overlap logic.
+
+        Polygon coordinates are normalized (0.0-1.0) in the config and
+        scaled to absolute pixels using ``image_shape`` at call time.
         """
         active_threshold = threshold if threshold is not None else self.iou_threshold
         raw_poly = slot.get("polygon", [])
+        slot_id = slot.get("slot_id", "UNKNOWN")
+
         if not raw_poly or len(raw_poly) < 3:
+            logger.debug("BAY %s: SKIP — polygon has fewer than 3 points", slot_id)
             return {
-                "slot_id": slot.get("slot_id", "UNKNOWN"),
+                "slot_id": slot_id,
                 "status": slot.get("status", "AVAILABLE"),
                 "confidence": 0.95,
                 "occupancy_score": 0.0,
                 "iou": 0.0,
             }
 
-        poly: list[list[float]] = []
-        if image_shape:
-            h, w = image_shape
-            for pt in raw_poly:
-                px = pt[0] * w if 0 <= pt[0] <= 1.0 else pt[0]
-                py = pt[1] * h if 0 <= pt[1] <= 1.0 else pt[1]
-                poly.append([float(px), float(py)])
-        else:
-            poly = [[float(pt[0]), float(pt[1])] for pt in raw_poly]
+        # Scale normalized coords → absolute pixels
+        poly = scale_polygon(raw_poly, image_shape)
 
         best_overlap = 0.0
         best_iou = 0.0
@@ -210,8 +241,20 @@ class SlotOccupancyEngine:
 
         confidence = round(max(0.75, min(0.99, best_conf if is_occupied else (1.0 - min(1.0, best_overlap)))), 2)
 
+        # Auditable logging for every bay decision
+        logger.info(
+            "BAY %s: status=%s confidence=%.2f overlap=%.3f iou=%.3f center_in_poly=%s matched=%s",
+            slot_id,
+            status,
+            confidence,
+            best_overlap,
+            best_iou,
+            bool(matched_det and calculate_polygon_bbox_overlap(poly, getattr(matched_det, "bbox", None) or (matched_det.get("bbox") if isinstance(matched_det, dict) else [0, 0, 0, 0]))[2]) if matched_det else False,
+            type(matched_det).__name__ if matched_det else "None",
+        )
+
         return {
-            "slot_id": slot["slot_id"],
+            "slot_id": slot_id,
             "status": status,
             "confidence": confidence,
             "occupancy_score": round(best_overlap, 3),

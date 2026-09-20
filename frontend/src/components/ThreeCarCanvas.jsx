@@ -6,6 +6,7 @@ export default function ThreeCarCanvas({ isRunning = true, carColor = '#00f0ff' 
   const mountRef = useRef(null)
   const [headlightsOn, setHeadlightsOn] = useState(true)
   const [nitroActive, setNitroActive] = useState(false)
+  const [modelLoading, setModelLoading] = useState(false)
   const carGroupRef = useRef(null)
   const wheelsRef = useRef([])
   const particlesRef = useRef(null)
@@ -68,6 +69,7 @@ export default function ThreeCarCanvas({ isRunning = true, carColor = '#00f0ff' 
     // Use the supplied GT3 RS model when a valid GLB is available; keep the
     // procedural car visible as a fallback while the asset loads or fails.
     const modelLoader = new GLTFLoader()
+    setModelLoading(true)
     modelLoader.load(
       '/gt3rs.glb',
       (gltf) => {
@@ -90,10 +92,12 @@ export default function ThreeCarCanvas({ isRunning = true, carColor = '#00f0ff' 
         modelRef.current = model
         carGroup.visible = false
         carGroupRef.current = model
+        setModelLoading(false)
       },
       undefined,
       (error) => {
         console.warn('GT3 RS GLB could not be loaded; using fallback car:', error)
+        setModelLoading(false)
       },
     )
 
@@ -347,7 +351,7 @@ export default function ThreeCarCanvas({ isRunning = true, carColor = '#00f0ff' 
       <div className="three-hud-overlay">
         <div className="hud-badge cyber-pulse">
           <span className="hud-dot" />
-          <span>AI-POWERED 3D CHASSIS TELEMETRY</span>
+          <span>{modelLoading ? 'LOADING 3D MODEL…' : 'AI-POWERED 3D CHASSIS TELEMETRY'}</span>
         </div>
         <div className="three-controls">
           <button

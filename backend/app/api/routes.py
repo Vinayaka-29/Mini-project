@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+# ── Request models ─────────────────────────────────────────────────────────────
+
 class AllocateRequest(BaseModel):
     vehicle_id: str
     vehicle_type: str = "car"
@@ -25,6 +27,10 @@ class AllocateRequest(BaseModel):
 
 class CameraToggleRequest(BaseModel):
     active: Optional[bool] = None
+
+
+class DetectionModeRequest(BaseModel):
+    mode: str  # "background_subtraction" or "yolo"
 
 
 class SlotLayoutItem(BaseModel):
@@ -44,9 +50,16 @@ class LayoutUpdateRequest(BaseModel):
     slots: list[dict[str, Any]]
 
 
+# ── Core endpoints ─────────────────────────────────────────────────────────────
+
 @router.get("/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "ai-park", "vision_model": "YOLOv8-Nano"}
+    return {
+        "status": "ok",
+        "service": "ai-park",
+        "detection_mode": get_detector().detection_mode,
+        "bg_calibrated": parking_service.bg_detector.has_reference,
+    }
 
 
 @router.get("/overview")
@@ -99,12 +112,13 @@ async def system() -> dict[str, Any]:
     return parking_service.get_system_status()
 
 
+# ── Layout configuration ───────────────────────────────────────────────────────
+
 @router.post("/config/layout")
-async def update_layout(payload: Union[LayoutUpdateRequest, dict[str, Any], list[dict[str, Any]]]) -> dict[str, Any]:
-    """
-    Dynamically update parking spot polygons in memory and disk.
-    Accepts new polygon coordinates from calibration tool or custom camera calibrations.
-    """
+async def update_layout(
+    payload: Union[LayoutUpdateRequest, dict[str, Any], list[dict[str, Any]]]
+) -> dict[str, Any]:
+    """Dynamically update parking spot polygons in memory and disk."""
     try:
         raw_layout: dict[str, Any] | list[dict[str, Any]]
         if isinstance(payload, LayoutUpdateRequest):
@@ -112,33 +126,75 @@ async def update_layout(payload: Union[LayoutUpdateRequest, dict[str, Any], list
         elif isinstance(payload, (dict, list)):
             raw_layout = payload
         else:
-            raw_layout = payload.model_dump() if hasattr(payload, "model_dump") else (payload.dict() if hasattr(payload, "dict") else dict(payload))
+            raw_layout = payload.model_dump() if hasattr(payload, "model_dump") else dict(payload)
 
-        # 1. Update state manager slots in memory & disk
         result = parking_service.state_manager.update_layout(raw_layout)
-
-        # 2. Update occupancy engine default slots
         global_occupancy_engine.set_layout(raw_layout)
 
-        logger.info("Dynamic layout successfully updated: %d slots loaded", result.get("total_slots", 0))
+        logger.info("Dynamic layout updated: %d slots loaded", result.get("total_slots", 0))
         return result
     except Exception as exc:
-        logger.error("Failed to update layout dynamically: %s", exc, exc_info=True)
+        logger.error("Failed to update layout: %s", exc, exc_info=True)
         raise HTTPException(status_code=400, detail=f"Failed to update layout: {str(exc)}") from exc
 
+
+# ── Reference frame (BG subtraction calibration) ──────────────────────────────
+
+@router.post("/reference-frame")
+async def set_reference_frame(
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Upload an empty-lot photo to calibrate background subtraction.
+
+    This must be called once before background-subtraction detection works.
+    Use a photo taken from the fixed camera with NO vehicles present.
+    """
+    if not file:
+        raise HTTPException(status_code=400, detail="No image file provided")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty image file received")
+
+    def _set(img_bytes: bytes) -> dict[str, Any]:
+        return parking_service.set_reference_frame(img_bytes)
+
+    result = await run_in_threadpool(_set, content)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message", "Failed to set reference frame"))
+    return result
+
+
+@router.get("/reference-frame/status")
+async def reference_frame_status() -> dict[str, Any]:
+    return {
+        "has_reference": parking_service.bg_detector.has_reference,
+        "detection_mode": get_detector().detection_mode,
+    }
+
+
+# ── Detection mode switching ───────────────────────────────────────────────────
+
+@router.post("/config/detection-mode")
+async def set_detection_mode(payload: DetectionModeRequest) -> dict[str, Any]:
+    """Switch between 'background_subtraction' (default) and 'yolo' detection."""
+    try:
+        get_detector().set_detection_mode(payload.mode)
+        return {"status": "success", "detection_mode": payload.mode}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ── Image detection ────────────────────────────────────────────────────────────
 
 @router.post("/detect/image")
 async def detect_image(
     file: UploadFile = File(...),
-    conf: float = Query(0.25, ge=0.01, le=1.0, description="YOLO detection confidence threshold"),
-):
-    """
-    Non-blocking endpoint for uploaded image processing with confidence tuning and graceful fallback:
-    1. Receives uploaded image.
-    2. Runs YOLOv8 vehicle detection with tuneable confidence threshold in worker threadpool.
-    3. Calculates spot availability using IoU and Point-in-Polygon occupancy engine.
-    4. Saves state and returns updated parking lot state.
-    5. Returns 400 for corrupted images and preserves existing slot state on unexpected 500 errors.
+    conf: float = Query(0.25, ge=0.01, le=1.0, description="YOLO confidence threshold (yolo mode only)"),
+) -> dict[str, Any]:
+    """Process an uploaded image. Routes to background subtraction or YOLO depending on mode.
+
+    Returns updated slot states, overview, and annotated image (base64).
+    All status values come from real detection — no mocked data.
     """
     if not file:
         raise HTTPException(status_code=400, detail="No image file provided")
@@ -148,42 +204,19 @@ async def detect_image(
         raise HTTPException(status_code=400, detail="Empty image file received")
 
     def pipeline(img_bytes: bytes) -> dict[str, Any]:
-        # 1. Convert bytes to OpenCV image
+        import numpy as np
         np_arr = np.frombuffer(img_bytes, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if frame is None:
-            raise ValueError("Could not decode image from uploaded bytes (invalid or corrupted image)")
-
-        # 2. Get global detector & find cars using specified confidence threshold
-        detector = get_detector()
-        detections = detector.detect(frame, conf_threshold=conf)
-
-        # 3. Calculate intersections
-        current_slots = list(parking_service.state_manager.slots.values())
-        h, w = frame.shape[:2]
-        updated = global_occupancy_engine.map_detections_to_spots(
-            slots=current_slots, detections=detections, image_shape=(h, w)
-        )
-
-        # 4. Save state
-        for spot in updated:
-            parking_service.state_manager.update_slot_status(spot["slot_id"], spot["status"])
-
-        # 5. Return updated lot
-        return {
-            "slots": parking_service.state_manager.get_slots(),
-            "overview": parking_service.state_manager.get_overview(),
-            "detections": [d.to_dict() if hasattr(d, "to_dict") else d for d in detections],
-            "total_detected_vehicles": len(detections),
-            "confidence_threshold": conf,
-        }
+            raise ValueError("Could not decode image (invalid or corrupted file)")
+        return parking_service.process_image_upload(img_bytes)
 
     try:
         return await run_in_threadpool(pipeline, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        logger.error("Inference execution failed: %s", exc, exc_info=True)
+        logger.error("Inference failed: %s", exc, exc_info=True)
         return JSONResponse(
             status_code=500,
             content={
@@ -195,6 +228,8 @@ async def detect_image(
         )
 
 
+# ── Camera streaming ───────────────────────────────────────────────────────────
+
 @router.post("/camera/toggle")
 async def toggle_camera(payload: CameraToggleRequest = CameraToggleRequest()) -> dict[str, Any]:
     """Start or stop the camera video feed & continuous AI scanning."""
@@ -203,16 +238,18 @@ async def toggle_camera(payload: CameraToggleRequest = CameraToggleRequest()) ->
 
 @router.get("/camera/feed")
 async def camera_feed():
-    """Live MJPEG video stream with real-time YOLO detections and slot overlays."""
+    """Live MJPEG video stream with real-time detections and slot overlays."""
     return StreamingResponse(
         parking_service.generate_camera_stream(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
+# ── Simulation / testing ───────────────────────────────────────────────────────
+
 @router.post("/simulate/event")
 async def simulate_event() -> dict[str, Any]:
-    """Trigger a simulated vehicle arrival or departure."""
+    """Trigger a simulated vehicle arrival or departure (testing only)."""
     return parking_service.simulate_random_event()
 
 

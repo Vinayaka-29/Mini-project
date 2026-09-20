@@ -1,34 +1,35 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ThreeCarCanvas from './components/ThreeCarCanvas'
 import PassModal from './components/PassModal'
-import { generateParkingSnapshot } from './utils/sampleImages'
-import { analyzeImageInBrowser } from './utils/browserVision'
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'https://ai-park-backend.onrender.com/api'
+// ── API configuration ────────────────────────────────────────────────────────
+const API_BASE =
+  import.meta.env.VITE_API_BASE ||
+  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+    ? 'http://127.0.0.1:8000/api'
+    : 'https://ai-park-backend.onrender.com/api')
 
-const DEFAULT_SLOTS = [
-  { slot_id: 'A01', section_id: 'A', status: 'AVAILABLE', priority: 1, distance_from_entries: 10, confidence: 0.98 },
-  { slot_id: 'A02', section_id: 'A', status: 'AVAILABLE', priority: 1, distance_from_entries: 12, confidence: 0.98 },
-  { slot_id: 'A03', section_id: 'A', status: 'AVAILABLE', priority: 1, distance_from_entries: 14, confidence: 0.98 },
-  { slot_id: 'A04', section_id: 'A', status: 'AVAILABLE', priority: 1, distance_from_entries: 16, confidence: 0.98 },
-  { slot_id: 'B01', section_id: 'B', status: 'AVAILABLE', priority: 2, distance_from_entries: 20, confidence: 0.98 },
-  { slot_id: 'B02', section_id: 'B', status: 'AVAILABLE', priority: 2, distance_from_entries: 22, confidence: 0.98 },
-  { slot_id: 'B03', section_id: 'B', status: 'AVAILABLE', priority: 2, distance_from_entries: 24, confidence: 0.98 },
-  { slot_id: 'B04', section_id: 'B', status: 'AVAILABLE', priority: 2, distance_from_entries: 26, confidence: 0.98 },
-]
+const WS_BASE = API_BASE.replace(/^https?/, (p) => (p === 'https' ? 'wss' : 'ws'))
+  .replace('/api', '')
 
+const COLD_START_TIMEOUT_MS = 60000  // Render free tier can take ~40-60s
+const RETRY_INTERVAL_MS = 5000
+
+// ── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [overview, setOverview] = useState({
-    total_slots: 8,
-    available: 8,
-    occupied: 0,
-    reserved: 0,
-    occupancy_pct: 0,
-  })
-  const [slots, setSlots] = useState(DEFAULT_SLOTS)
+  // State
+  const [overview, setOverview] = useState(null)
+  const [slots, setSlots] = useState([])
   const [sections, setSections] = useState([])
   const [events, setEvents] = useState([])
-  const [activeTab, setActiveTab] = useState('upload') // 'upload' | 'stream'
+
+  const [backendOnline, setBackendOnline] = useState(null)   // null=checking, true, false
+  const [wakingUp, setWakingUp] = useState(false)
+  const [wakeCountdown, setWakeCountdown] = useState(0)
+  const [bgCalibrated, setBgCalibrated] = useState(false)
+  const [detectionMode, setDetectionMode] = useState('background_subtraction')
+
+  const [activeTab, setActiveTab] = useState('upload')
   const [cameraActive, setCameraActive] = useState(false)
   const [cameraMode, setCameraMode] = useState('device')
   const [deviceCameraActive, setDeviceCameraActive] = useState(false)
@@ -39,147 +40,276 @@ export default function App() {
   const [licensePlate, setLicensePlate] = useState('')
   const [vehicleType, setVehicleType] = useState('car')
   const [issuedTicket, setIssuedTicket] = useState(null)
-  const [statusMsg, setStatusMsg] = useState('SYSTEM ONLINE • YOLOv8 READY')
-  const [isCarBoosted, setIsCarBoosted] = useState(true)
+  const [statusMsg, setStatusMsg] = useState('CHECKING BACKEND…')
+  const [isCarBoosted] = useState(true)
 
   const fileInputRef = useRef(null)
+  const refFileInputRef = useRef(null)
   const videoRef = useRef(null)
   const deviceStreamRef = useRef(null)
+  const wsRef = useRef(null)
+  const retryTimerRef = useRef(null)
+  const wakeTimerRef = useRef(null)
+  const wakeStartRef = useRef(null)
 
-  // Fetch initial data
-  const fetchData = async () => {
+  // ── Backend health check & cold-start handling ──────────────────────────
+  const checkHealth = useCallback(async () => {
     try {
-      const [ovRes, slRes, evRes] = await Promise.all([
+      const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(8000) })
+      if (res.ok) {
+        const data = await res.json()
+        setBackendOnline(true)
+        setWakingUp(false)
+        setWakeCountdown(0)
+        if (wakeTimerRef.current) clearInterval(wakeTimerRef.current)
+        setBgCalibrated(data.bg_calibrated ?? false)
+        setDetectionMode(data.detection_mode ?? 'background_subtraction')
+        setStatusMsg(
+          data.bg_calibrated
+            ? 'SYSTEM ONLINE • BG-SUBTRACTION READY'
+            : 'ONLINE • ⚠️ UPLOAD REFERENCE FRAME FIRST'
+        )
+        return true
+      }
+    } catch {
+      // Fall through
+    }
+    return false
+  }, [])
+
+  const startWakeSequence = useCallback(() => {
+    setWakingUp(true)
+    setBackendOnline(false)
+    setStatusMsg('⏳ WAKING BACKEND SERVER (~40s)…')
+    wakeStartRef.current = Date.now()
+    setWakeCountdown(Math.round(COLD_START_TIMEOUT_MS / 1000))
+
+    // Countdown ticker
+    wakeTimerRef.current = setInterval(() => {
+      const elapsed = Date.now() - wakeStartRef.current
+      const remaining = Math.max(0, Math.round((COLD_START_TIMEOUT_MS - elapsed) / 1000))
+      setWakeCountdown(remaining)
+    }, 1000)
+
+    // Retry health check every 5s
+    retryTimerRef.current = setInterval(async () => {
+      const ok = await checkHealth()
+      if (ok) {
+        clearInterval(retryTimerRef.current)
+        clearInterval(wakeTimerRef.current)
+        fetchData()
+      } else if (Date.now() - wakeStartRef.current > COLD_START_TIMEOUT_MS) {
+        clearInterval(retryTimerRef.current)
+        clearInterval(wakeTimerRef.current)
+        setWakingUp(false)
+        setStatusMsg('❌ BACKEND UNREACHABLE — CHECK SERVER')
+      }
+    }, RETRY_INTERVAL_MS)
+  }, [checkHealth])
+
+  // ── Data fetching ────────────────────────────────────────────────────────
+  const fetchData = useCallback(async () => {
+    try {
+      const [ovRes, slRes, evRes, secRes] = await Promise.all([
         fetch(`${API_BASE}/overview`),
         fetch(`${API_BASE}/slots`),
         fetch(`${API_BASE}/events`),
+        fetch(`${API_BASE}/sections`),
       ])
       if (ovRes.ok) setOverview(await ovRes.json())
       if (slRes.ok) {
-        const slData = await slRes.json()
-        if (slData.slots && slData.slots.length) setSlots(slData.slots)
+        const d = await slRes.json()
+        if (d.slots) setSlots(d.slots)
       }
       if (evRes.ok) {
-        const evData = await evRes.json()
-        setEvents(evData.events || [])
+        const d = await evRes.json()
+        setEvents(d.events || [])
       }
-    } catch (err) {
-      // Running standalone/offline gracefully
-    }
-  }
-
-  useEffect(() => {
-    fetchData()
-    const interval = setInterval(fetchData, 4000)
-    return () => {
-      clearInterval(interval)
-      deviceStreamRef.current?.getTracks().forEach((track) => track.stop())
+      if (secRes.ok) {
+        const d = await secRes.json()
+        setSections(d.sections || [])
+      }
+    } catch {
+      // WS handles live updates; polling is a fallback
     }
   }, [])
 
-  // Handle uploaded image file (Prioritize Local/Cloud Python YOLOv8 -> Autonomous Browser Engine)
+  // ── WebSocket subscription ───────────────────────────────────────────────
+  const connectWS = useCallback(() => {
+    if (!backendOnline) return
+    if (wsRef.current?.readyState === WebSocket.OPEN) return
+
+    try {
+      const ws = new WebSocket(`${WS_BASE}/ws`)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        // Keep-alive ping every 30s
+        const pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) ws.send('ping')
+        }, 30000)
+        ws._pingInterval = pingInterval
+      }
+
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data)
+          if (msg.type === 'STATE_UPDATE') {
+            if (msg.overview) setOverview(msg.overview)
+            if (msg.slots) setSlots(msg.slots)
+            if (msg.events) setEvents(msg.events)
+          }
+        } catch {}
+      }
+
+      ws.onclose = () => {
+        clearInterval(ws._pingInterval)
+        // Reconnect after 3s if backend is still online
+        setTimeout(() => {
+          if (backendOnline) connectWS()
+        }, 3000)
+      }
+
+      ws.onerror = () => ws.close()
+    } catch {}
+  }, [backendOnline])
+
+  // ── Startup sequence ─────────────────────────────────────────────────────
+  useEffect(() => {
+    const init = async () => {
+      const ok = await checkHealth()
+      if (ok) {
+        await fetchData()
+      } else {
+        startWakeSequence()
+      }
+    }
+    init()
+
+    return () => {
+      clearInterval(retryTimerRef.current)
+      clearInterval(wakeTimerRef.current)
+      wsRef.current?.close()
+      deviceStreamRef.current?.getTracks().forEach((t) => t.stop())
+    }
+  }, [])
+
+  useEffect(() => {
+    if (backendOnline) {
+      connectWS()
+      // Fallback polling every 10s (WS is primary)
+      const pollInterval = setInterval(fetchData, 10000)
+      return () => clearInterval(pollInterval)
+    }
+  }, [backendOnline, connectWS, fetchData])
+
+  // ── Image upload / detection ─────────────────────────────────────────────
   const handleFileUpload = async (file) => {
-    if (!file) return
+    if (!file || !backendOnline) return
     setIsScanning(true)
-    setStatusMsg('SCANNING IMAGE WITH YOLOv8 NEURAL NETWORK...')
+    setStatusMsg('SCANNING IMAGE…')
 
     const formData = new FormData()
     formData.append('file', file)
 
-    const candidateUrls = [
-      'http://127.0.0.1:8000/api',
-      API_BASE,
-      '/api',
-    ]
-
-    let data = null
-    for (const baseUrl of candidateUrls) {
-      if (!baseUrl) continue
-      try {
-        const res = await fetch(`${baseUrl}/detect/image`, {
-          method: 'POST',
-          body: formData,
+    try {
+      const res = await fetch(`${API_BASE}/detect/image`, { method: 'POST', body: formData })
+      if (res.ok) {
+        const data = await res.json()
+        setAnnotatedImage(data.annotated_image || null)
+        if (data.overview) setOverview(data.overview)
+        if (data.slots) setSlots(data.slots)
+        setTelemetry({
+          detectedCount: data.total_detected_vehicles,
+          inferenceTime: data.inference_time_ms,
+          detections: data.detections || [],
+          mode: data.detection_mode,
         })
-        if (res.ok) {
-          data = await res.json()
-          break
-        }
-      } catch (e) {
-        // try next endpoint
+        setStatusMsg(
+          `SCAN COMPLETE: ${data.total_detected_vehicles} OCCUPIED BAYS DETECTED (${data.inference_time_ms}ms)`
+        )
+      } else {
+        const err = await res.json()
+        setStatusMsg(`SCAN ERROR: ${err.detail || 'Unknown error'}`)
       }
+    } catch (err) {
+      setStatusMsg(`NETWORK ERROR: ${err.message}`)
     }
 
-    if (data) {
-      setAnnotatedImage(data.annotated_image)
-      setOverview(data.overview)
-      setSlots(data.slots)
-      setTelemetry({
-        detectedCount: data.total_detected_vehicles,
-        inferenceTime: data.inference_time_ms,
-        detections: data.detections,
-      })
-      setStatusMsg(`YOLOv8 SCAN COMPLETE: ${data.total_detected_vehicles} VEHICLES LOCATED (${data.inference_time_ms}ms)`)
-    } else {
-      console.warn('Backend unavailable, running autonomous in-browser vision engine...')
-      const browserData = await analyzeImageInBrowser(file)
-      setAnnotatedImage(browserData.annotated_image)
-      setOverview(browserData.overview)
-      setSlots(browserData.slots)
-      setTelemetry({
-        detectedCount: browserData.total_detected_vehicles,
-        inferenceTime: browserData.inference_time_ms,
-        detections: browserData.detections,
-      })
-      setStatusMsg(`YOLOv8 SCAN COMPLETE: ${browserData.total_detected_vehicles} VEHICLES LOCATED (${browserData.inference_time_ms}ms)`)
-    }
     setIsScanning(false)
   }
 
-  // Quick Preset Sample Generator
-  const runPresetSample = async (scenario) => {
-    setIsScanning(true)
-    const blob = await generateParkingSnapshot(scenario)
-    const testFile = new File([blob], `sample_${scenario}.jpg`, { type: 'image/jpeg' })
-    await handleFileUpload(testFile)
+  // ── Reference frame upload ───────────────────────────────────────────────
+  const handleReferenceUpload = async (file) => {
+    if (!file || !backendOnline) return
+    setStatusMsg('UPLOADING REFERENCE FRAME…')
+
+    const formData = new FormData()
+    formData.append('file', file)
+
+    try {
+      const res = await fetch(`${API_BASE}/reference-frame`, { method: 'POST', body: formData })
+      if (res.ok) {
+        const data = await res.json()
+        setBgCalibrated(true)
+        setStatusMsg('✅ REFERENCE FRAME SET — BG SUBTRACTION CALIBRATED')
+      } else {
+        const err = await res.json()
+        setStatusMsg(`REFERENCE ERROR: ${err.detail}`)
+      }
+    } catch (err) {
+      setStatusMsg(`NETWORK ERROR: ${err.message}`)
+    }
   }
 
-  // Camera Toggle
+  // ── Sample photo presets (real photos from /public/) ─────────────────────
+  const runSamplePhoto = async (filename) => {
+    if (!backendOnline) return
+    setIsScanning(true)
+    setStatusMsg(`LOADING ${filename}…`)
+    try {
+      const res = await fetch(`/${filename}`)
+      if (!res.ok) throw new Error(`Could not fetch /${filename}`)
+      const blob = await res.blob()
+      const file = new File([blob], filename, { type: blob.type || 'image/jpeg' })
+      await handleFileUpload(file)
+    } catch (err) {
+      setStatusMsg(`Could not load sample: ${err.message}`)
+      setIsScanning(false)
+    }
+  }
+
+  // ── Camera controls ──────────────────────────────────────────────────────
   const toggleCamera = async () => {
-    const nextState = !cameraActive
+    if (!backendOnline) return
+    const next = !cameraActive
     try {
       const res = await fetch(`${API_BASE}/camera/toggle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ active: nextState }),
+        body: JSON.stringify({ active: next }),
       })
       if (res.ok) {
-        setCameraActive(nextState)
-        setStatusMsg(nextState ? 'LIVE CCTV CAMERA STREAM ACTIVE' : 'CCTV STREAM PAUSED (STANDBY)')
+        setCameraActive(next)
+        setStatusMsg(next ? 'LIVE CCTV STREAM ACTIVE' : 'CCTV STREAM PAUSED')
       }
-    } catch (err) {
-      console.error(err)
-    }
+    } catch {}
   }
 
   const stopDeviceCamera = () => {
-    deviceStreamRef.current?.getTracks().forEach((track) => track.stop())
+    deviceStreamRef.current?.getTracks().forEach((t) => t.stop())
     deviceStreamRef.current = null
     if (videoRef.current) videoRef.current.srcObject = null
     setDeviceCameraActive(false)
-    setStatusMsg('MOBILE CAMERA PAUSED (STANDBY)')
+    setStatusMsg('MOBILE CAMERA PAUSED')
   }
 
   const toggleDeviceCamera = async () => {
-    if (deviceCameraActive) {
-      stopDeviceCamera()
-      return
-    }
-
+    if (deviceCameraActive) { stopDeviceCamera(); return }
     if (!navigator.mediaDevices?.getUserMedia) {
-      setStatusMsg('DEVICE CAMERA IS NOT AVAILABLE IN THIS BROWSER')
+      setStatusMsg('DEVICE CAMERA NOT AVAILABLE IN THIS BROWSER')
       return
     }
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -191,33 +321,35 @@ export default function App() {
         await videoRef.current.play()
       }
       setDeviceCameraActive(true)
-      setStatusMsg('MOBILE CAMERA LIVE (REAR CAMERA)')
+      setStatusMsg('MOBILE CAMERA LIVE (REAR)')
     } catch (err) {
-      console.error('Device camera error:', err)
-      setStatusMsg('CAMERA ACCESS DENIED OR UNAVAILABLE')
+      setStatusMsg('CAMERA ACCESS DENIED')
     }
   }
 
   const scanDeviceCameraFrame = async () => {
     const video = videoRef.current
     if (!video || video.readyState < 2 || !video.videoWidth) {
-      setStatusMsg('START THE MOBILE CAMERA BEFORE SCANNING')
+      setStatusMsg('START MOBILE CAMERA BEFORE SCANNING')
       return
     }
-
     const canvas = document.createElement('canvas')
     canvas.width = video.videoWidth
     canvas.height = video.videoHeight
-    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height)
+    canvas.getContext('2d').drawImage(video, 0, 0)
     canvas.toBlob((blob) => {
-      if (blob) handleFileUpload(new File([blob], 'mobile-camera-frame.jpg', { type: 'image/jpeg' }))
-    }, 'image/jpeg', 0.88)
+      if (blob) handleFileUpload(new File([blob], 'camera-frame.jpg', { type: 'image/jpeg' }))
+    }, 'image/jpeg', 0.90)
   }
 
-  // Smart Slot Allocation (Hybrid Cloud + Local)
+  // ── Slot allocation ──────────────────────────────────────────────────────
   const handleAllocate = async (e) => {
     e.preventDefault()
-    const plate = licensePlate.trim() || `KA-${Math.floor(Math.random() * 89 + 10)}-GT-${Math.floor(Math.random() * 8999 + 1000)}`
+    if (!backendOnline) { setStatusMsg('BACKEND OFFLINE — CANNOT ALLOCATE'); return }
+
+    const plate =
+      licensePlate.trim() ||
+      `KA-${Math.floor(Math.random() * 89 + 10)}-GT-${Math.floor(Math.random() * 8999 + 1000)}`
 
     try {
       const res = await fetch(`${API_BASE}/allocate`, {
@@ -230,128 +362,105 @@ export default function App() {
         setIssuedTicket(ticketData)
         setLicensePlate('')
         fetchData()
-        return
+        setStatusMsg(`BAY ${ticketData.slot_id} RESERVED FOR ${plate}`)
+      } else {
+        const err = await res.json()
+        setStatusMsg(`ALLOCATION FAILED: ${err.detail}`)
       }
     } catch (err) {
-      // Offline/Vercel local allocation
+      setStatusMsg(`NETWORK ERROR: ${err.message}`)
     }
-
-    // Local smart allocation fallback
-    const currentSlots = slots.length ? slots : DEFAULT_SLOTS
-    const freeSlot = currentSlots.find((s) => s.status === 'AVAILABLE')
-    if (!freeSlot) {
-      alert('Parking Full! No available slots currently.')
-      return
-    }
-
-    const updatedSlots = currentSlots.map((s) =>
-      s.slot_id === freeSlot.slot_id ? { ...s, status: 'RESERVED', vehicle_id: plate } : s
-    )
-    setSlots(updatedSlots)
-    setOverview((prev) => ({
-      ...prev,
-      available: Math.max(0, prev.available - 1),
-      reserved: (prev.reserved || 0) + 1,
-    }))
-    setEvents((prev) => [
-      {
-        event_id: `EVT-00${prev.length + 1}`,
-        slot_id: freeSlot.slot_id,
-        status: 'RESERVED',
-        event_type: 'VEHICLE_ASSIGNED',
-        timestamp: new Date().toISOString(),
-        vehicle_id: plate,
-        confidence: 0.95,
-      },
-      ...prev,
-    ])
-    setIssuedTicket({
-      ticket_id: `TKT-${Math.floor(Math.random() * 89999 + 10000)}`,
-      vehicle_id: plate,
-      vehicle_type: vehicleType,
-      slot_id: freeSlot.slot_id,
-      section_id: freeSlot.section_id || 'A',
-      status: 'RESERVED',
-      distance: freeSlot.distance_from_entries || 10,
-      issued_at: new Date().toISOString(),
-    })
-    setLicensePlate('')
-    setStatusMsg(`VIP BAY ${freeSlot.slot_id} RESERVED FOR ${plate}`)
   }
 
-  // Simulate Traffic Flow
+  // ── Simulate / reset (backend only) ─────────────────────────────────────
   const simulateTraffic = async () => {
+    if (!backendOnline) return
     try {
       const res = await fetch(`${API_BASE}/simulate/event`, { method: 'POST' })
-      if (res.ok) {
-        const ov = await res.json()
-        setOverview(ov)
-        fetchData()
-        setStatusMsg('SIMULATED RANDOM VEHICLE MOVEMENT')
-        return
-      }
-    } catch (err) {
-      // Local simulation
-    }
-
-    const currentSlots = slots.length ? slots : DEFAULT_SLOTS
-    const randomIdx = Math.floor(Math.random() * currentSlots.length)
-    const targetSlot = currentSlots[randomIdx]
-    const nextStatus = targetSlot.status === 'AVAILABLE' ? 'OCCUPIED' : 'AVAILABLE'
-    const plate = nextStatus === 'OCCUPIED' ? `KA-0${Math.floor(Math.random() * 9 + 1)}-AI-${Math.floor(Math.random() * 8999 + 1000)}` : null
-
-    const updated = currentSlots.map((s, idx) =>
-      idx === randomIdx ? { ...s, status: nextStatus, vehicle_id: plate } : s
-    )
-    setSlots(updated)
-    const occ = updated.filter((s) => s.status === 'OCCUPIED').length
-    setOverview((prev) => ({
-      ...prev,
-      occupied: occ,
-      available: updated.length - occ,
-      occupancy_pct: +((occ / updated.length) * 100).toFixed(1),
-    }))
-    setStatusMsg(`SIMULATED: BAY ${targetSlot.slot_id} IS NOW ${nextStatus}`)
+      if (res.ok) { fetchData(); setStatusMsg('SIMULATED RANDOM VEHICLE MOVEMENT') }
+    } catch {}
   }
 
-  // Reset All Slots
   const resetBays = async () => {
+    if (!backendOnline) return
     try {
       const res = await fetch(`${API_BASE}/simulate/reset`, { method: 'POST' })
-      if (res.ok) {
-        setOverview(await res.json())
-        setAnnotatedImage(null)
-        setTelemetry(null)
-        fetchData()
-        setStatusMsg('ALL PARKING BAYS RESET TO VACANT')
-        return
-      }
-    } catch (err) {
-      // Local reset
-    }
-
-    setSlots(DEFAULT_SLOTS.map((s) => ({ ...s, status: 'AVAILABLE', vehicle_id: null })))
-    setOverview({
-      total_slots: 8,
-      available: 8,
-      occupied: 0,
-      reserved: 0,
-      unknown: 0,
-      occupancy_pct: 0,
-      last_analysis_time: null,
-      active_detections: 0,
-    })
-    setAnnotatedImage(null)
-    setTelemetry(null)
-    setStatusMsg('ALL PARKING BAYS RESET TO VACANT')
+      if (res.ok) { fetchData(); setAnnotatedImage(null); setTelemetry(null); setStatusMsg('ALL BAYS RESET TO VACANT') }
+    } catch {}
   }
 
-  // Filtered Slots
+  // ── Derived values ───────────────────────────────────────────────────────
   const filteredSlots = useMemo(() => {
     if (sectionFilter === 'ALL') return slots
     return slots.filter((s) => (s.section_id || 'A') === sectionFilter)
   }, [slots, sectionFilter])
 
+  const uniqueSections = useMemo(
+    () => [...new Set(slots.map((s) => s.section_id || 'A'))].sort(),
+    [slots]
+  )
+
+  const displayOverview = overview || { total_slots: 0, available: 0, occupied: 0, reserved: 0, occupancy_pct: 0 }
+
+  // ── Offline banner ───────────────────────────────────────────────────────
+  const renderOfflineBanner = () => {
+    if (backendOnline === true) return null
+    return (
+      <div className="offline-banner" role="alert">
+        {wakingUp ? (
+          <>
+            <span className="offline-icon">⏳</span>
+            <div>
+              <strong>WAKING BACKEND SERVER</strong>
+              <p>Render free tier is spinning up… {wakeCountdown > 0 ? `~${wakeCountdown}s remaining` : 'almost there'}</p>
+            </div>
+          </>
+        ) : backendOnline === false && !wakingUp ? (
+          <>
+            <span className="offline-icon">⚠️</span>
+            <div>
+              <strong>BACKEND UNREACHABLE</strong>
+              <p>All detection features are disabled. Check the server or try again.</p>
+            </div>
+            <button className="cyber-btn secondary" onClick={() => { setBackendOnline(null); startWakeSequence() }}>
+              RETRY
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="offline-icon">🔄</span>
+            <strong>CONNECTING TO BACKEND…</strong>
+          </>
+        )}
+      </div>
+    )
+  }
+
+  // ── BG calibration banner ────────────────────────────────────────────────
+  const renderCalibrationBanner = () => {
+    if (!backendOnline || bgCalibrated || detectionMode !== 'background_subtraction') return null
+    return (
+      <div className="calibration-banner" role="status">
+        <span>📸</span>
+        <div>
+          <strong>BACKGROUND SUBTRACTION NEEDS CALIBRATION</strong>
+          <p>Upload an empty-lot reference photo (no cars) before scanning.</p>
+        </div>
+        <button className="cyber-btn secondary" onClick={() => refFileInputRef.current?.click()}>
+          UPLOAD REFERENCE
+        </button>
+        <input
+          type="file"
+          ref={refFileInputRef}
+          style={{ display: 'none' }}
+          accept="image/*"
+          onChange={(e) => { if (e.target.files?.[0]) handleReferenceUpload(e.target.files[0]) }}
+        />
+      </div>
+    )
+  }
+
+  // ── Render ───────────────────────────────────────────────────────────────
   return (
     <div className="app-shell">
       {/* TOPBAR */}
@@ -365,7 +474,7 @@ export default function App() {
         </div>
 
         <div className="topbar-actions">
-          <div className="status-pill">
+          <div className={`status-pill ${backendOnline ? '' : 'offline'}`}>
             <span className="status-dot" />
             <span>{statusMsg}</span>
           </div>
@@ -381,14 +490,18 @@ export default function App() {
         </div>
       </header>
 
+      {/* OFFLINE BANNER */}
+      {renderOfflineBanner()}
+
+      {/* CALIBRATION BANNER */}
+      {renderCalibrationBanner()}
+
       {/* HERO SECTION: 3D CYBER CAR + SMART ALLOCATION */}
       <section className="hero-section">
-        {/* 3D Interactive Luxury Hypercar */}
         <div className="three-car-panel">
           <ThreeCarCanvas isRunning={isCarBoosted} carColor="#00f0ff" />
         </div>
 
-        {/* Smart Parking Ticket Pass Allocation Panel */}
         <div className="action-hero-panel">
           <div>
             <div className="action-hero-title">
@@ -396,7 +509,7 @@ export default function App() {
               <h3>VIP SMART ALLOCATION</h3>
             </div>
             <p className="eyebrow" style={{ marginTop: 4 }}>
-              Instant AI Nearest-Bay Reservation & Digital Pass
+              Instant AI Nearest-Bay Reservation &amp; Digital Pass
             </p>
           </div>
 
@@ -409,6 +522,7 @@ export default function App() {
                 placeholder="e.g. KA-05-MK-9999"
                 value={licensePlate}
                 onChange={(e) => setLicensePlate(e.target.value)}
+                disabled={!backendOnline}
               />
             </div>
 
@@ -418,6 +532,7 @@ export default function App() {
                 className="cyber-input"
                 value={vehicleType}
                 onChange={(e) => setVehicleType(e.target.value)}
+                disabled={!backendOnline}
               >
                 <option value="car">Hypercar / Sedan</option>
                 <option value="suv">Luxury SUV</option>
@@ -426,16 +541,16 @@ export default function App() {
               </select>
             </div>
 
-            <button type="submit" className="cyber-btn primary">
+            <button type="submit" className="cyber-btn primary" disabled={!backendOnline}>
               RESERVE OPTIMAL BAY ➔
             </button>
           </form>
 
           <div className="quick-tools">
-            <button className="cyber-btn secondary" onClick={simulateTraffic} style={{ flex: 1 }}>
+            <button className="cyber-btn secondary" onClick={simulateTraffic} disabled={!backendOnline} style={{ flex: 1 }}>
               🎲 SIMULATE TRAFFIC
             </button>
-            <button className="cyber-btn secondary" onClick={resetBays} style={{ flex: 1 }}>
+            <button className="cyber-btn secondary" onClick={resetBays} disabled={!backendOnline} style={{ flex: 1 }}>
               🔄 RESET ALL BAYS
             </button>
           </div>
@@ -446,165 +561,114 @@ export default function App() {
       <section className="stats-grid">
         <div className="stat-card cyan">
           <span className="stat-label">Total Parking Bays</span>
-          <strong className="stat-val">{overview.total_slots}</strong>
-          <span className="stat-sub">High-Definition Monitored</span>
+          <strong className="stat-val">{displayOverview.total_slots}</strong>
+          <span className="stat-sub">Camera-Monitored</span>
         </div>
-
         <div className="stat-card emerald">
           <span className="stat-label">Available Slots</span>
-          <strong className="stat-val" style={{ color: 'var(--neon-emerald)' }}>
-            {overview.available}
-          </strong>
-          <span className="stat-sub">Ready for immediate parking</span>
+          <strong className="stat-val" style={{ color: 'var(--neon-emerald)' }}>{displayOverview.available}</strong>
+          <span className="stat-sub">Ready for parking</span>
         </div>
-
         <div className="stat-card crimson">
           <span className="stat-label">Occupied Slots</span>
-          <strong className="stat-val" style={{ color: 'var(--neon-crimson)' }}>
-            {overview.occupied}
-          </strong>
+          <strong className="stat-val" style={{ color: 'var(--neon-crimson)' }}>{displayOverview.occupied}</strong>
           <span className="stat-sub">Vehicles detected</span>
         </div>
-
         <div className="stat-card amber">
           <span className="stat-label">Reserved Passes</span>
-          <strong className="stat-val" style={{ color: 'var(--neon-amber)' }}>
-            {overview.reserved}
-          </strong>
+          <strong className="stat-val" style={{ color: 'var(--neon-amber)' }}>{displayOverview.reserved}</strong>
           <span className="stat-sub">VIP assigned</span>
         </div>
-
         <div className="stat-card cyan">
           <span className="stat-label">Occupancy Rate</span>
-          <strong className="stat-val">{overview.occupancy_pct}%</strong>
-          <span className="stat-sub">Real-time facility capacity</span>
+          <strong className="stat-val">{displayOverview.occupancy_pct}%</strong>
+          <span className="stat-sub">Real-time capacity</span>
         </div>
       </section>
 
-      {/* DUAL WORKSPACE: VISION SCANNER / LIVE STREAM + 3D PARKING GRID */}
+      {/* WORKSPACE: VISION SCANNER + PARKING GRID */}
       <section className="workspace-grid">
-        {/* LEFT PANEL: VISION ENGINE */}
+        {/* LEFT: VISION ENGINE */}
         <div className="panel">
           <div className="panel-header">
             <div className="panel-title">
               <span>👁️</span>
-              <h3>YOLOv8 VISION INTELLIGENCE</h3>
+              <h3>VISION INTELLIGENCE</h3>
             </div>
             <div className="tab-group">
-              <button
-                className={`tab-btn ${activeTab === 'upload' ? 'active' : ''}`}
-                onClick={() => setActiveTab('upload')}
-              >
+              <button className={`tab-btn ${activeTab === 'upload' ? 'active' : ''}`} onClick={() => setActiveTab('upload')}>
                 📸 IMAGE SCAN
               </button>
-              <button
-                className={`tab-btn ${activeTab === 'stream' ? 'active' : ''}`}
-                onClick={() => setActiveTab('stream')}
-              >
-                📹 LIVE CCTV STREAM
+              <button className={`tab-btn ${activeTab === 'stream' ? 'active' : ''}`} onClick={() => setActiveTab('stream')}>
+                📹 LIVE STREAM
               </button>
             </div>
           </div>
 
           {activeTab === 'upload' ? (
             <>
-              {/* IMAGE UPLOAD & SCANNER VIEWPORT */}
-              <div
-                className="scanner-viewport"
-                onClick={() => fileInputRef.current && fileInputRef.current.click()}
-              >
+              <div className="scanner-viewport" onClick={() => backendOnline && fileInputRef.current?.click()}>
                 <input
                   type="file"
                   ref={fileInputRef}
                   style={{ display: 'none' }}
                   accept="image/*"
                   capture="environment"
-                  onChange={(e) => {
-                    if (e.target.files && e.target.files[0]) {
-                      handleFileUpload(e.target.files[0])
-                    }
-                  }}
+                  onChange={(e) => { if (e.target.files?.[0]) handleFileUpload(e.target.files[0]) }}
                 />
-
                 {isScanning && <div className="scanner-beam" />}
-
                 {annotatedImage ? (
-                  <img
-                    src={annotatedImage}
-                    alt="YOLO Detection Preview"
-                    className="scanner-image-preview"
-                  />
+                  <img src={annotatedImage} alt="Detection Result" className="scanner-image-preview" />
                 ) : (
                   <div className="dropzone-empty">
                     <span className="dropzone-icon">📷</span>
                     <div className="dropzone-text">
-                      <h4>Drop Parking Photo or Tap to Snap Camera</h4>
-                      <p>Supports JPG, PNG, Mobile Camera Snap, CCTV Stills</p>
+                      <h4>
+                        {backendOnline
+                          ? 'Drop Parking Photo or Tap to Snap'
+                          : 'Backend Offline — Detection Disabled'}
+                      </h4>
+                      <p>
+                        {backendOnline
+                          ? 'Supports JPG, PNG, Mobile Camera, CCTV stills'
+                          : 'Waiting for backend server…'}
+                      </p>
                     </div>
-                    <button
-                      className="cyber-btn secondary"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        fileInputRef.current && fileInputRef.current.click()
-                      }}
-                    >
-                      SELECT LOCAL IMAGE
-                    </button>
+                    {backendOnline && (
+                      <button className="cyber-btn secondary" onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click() }}>
+                        SELECT IMAGE
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
 
-              {/* QUICK DEMO PRESETS */}
+              {/* Real sample photo presets */}
               <div className="preset-strip">
-                <span>⚡ Instant Demos:</span>
-                <button
-                  className="preset-chip"
-                  onClick={() => runPresetSample('empty')}
-                >
-                  🟢 Empty Lot (All Free)
+                <span>⚡ Test with real photos:</span>
+                <button className="preset-chip" onClick={() => runSamplePhoto('sample_cardboard_test.jpg')} disabled={!backendOnline || isScanning}>
+                  📦 Cardboard Lot
                 </button>
-                <button
-                  className="preset-chip"
-                  onClick={() => runPresetSample('half')}
-                >
-                  🟡 50% Occupied
-                </button>
-                <button
-                  className="preset-chip"
-                  onClick={() => runPresetSample('crowded')}
-                >
-                  🔴 High Density (Busy)
+                <button className="preset-chip" onClick={() => runSamplePhoto('sample_cctv_test.jpg')} disabled={!backendOnline || isScanning}>
+                  📹 CCTV Frame
                 </button>
               </div>
 
-              {/* TELEMETRY */}
               {telemetry && (
                 <div className="telemetry-bar">
-                  <span>
-                    Detected: <strong>{telemetry.detectedCount} Vehicles</strong>
-                  </span>
-                  <span>
-                    Inference: <strong>{telemetry.inferenceTime} ms</strong>
-                  </span>
-                  <span>
-                    Vision Model: <strong>YOLOv8-Nano</strong>
-                  </span>
+                  <span>Occupied Bays: <strong>{telemetry.detectedCount}</strong></span>
+                  <span>Time: <strong>{telemetry.inferenceTime}ms</strong></span>
+                  <span>Mode: <strong>{telemetry.mode === 'background_subtraction' ? 'BG-SUB' : 'YOLOv8'}</strong></span>
                 </div>
               )}
             </>
           ) : (
             <>
               <div className="camera-mode-tabs">
-                <button
-                  className={`tab-btn ${cameraMode === 'device' ? 'active' : ''}`}
-                  onClick={() => setCameraMode('device')}
-                >
+                <button className={`tab-btn ${cameraMode === 'device' ? 'active' : ''}`} onClick={() => setCameraMode('device')}>
                   📱 MOBILE CAMERA
                 </button>
-                <button
-                  className={`tab-btn ${cameraMode === 'server' ? 'active' : ''}`}
-                  onClick={() => setCameraMode('server')}
-                >
+                <button className={`tab-btn ${cameraMode === 'server' ? 'active' : ''}`} onClick={() => setCameraMode('server')}>
                   🖥️ SERVER CCTV
                 </button>
               </div>
@@ -616,73 +680,60 @@ export default function App() {
                       ref={videoRef}
                       className="scanner-image-preview"
                       style={{ maxHeight: 360, width: '100%', background: '#000' }}
-                      autoPlay
-                      muted
-                      playsInline
+                      autoPlay muted playsInline
                     />
                     {!deviceCameraActive && (
                       <div className="dropzone-empty camera-prompt">
                         <span className="dropzone-icon">📱</span>
                         <div className="dropzone-text">
                           <h4>Use your phone camera for live parking scans</h4>
-                          <p>Allow camera access, then scan a frame with AI detection</p>
+                          <p>Allow camera access, then snap a frame for AI detection</p>
                         </div>
                       </div>
                     )}
                   </div>
                   <div style={{ display: 'flex', gap: 10 }}>
-                    <button
-                      className={`cyber-btn ${deviceCameraActive ? 'secondary' : 'primary'}`}
-                      style={{ flex: 1 }}
-                      onClick={toggleDeviceCamera}
-                    >
-                      {deviceCameraActive ? '⏸️ STOP MOBILE CAMERA' : '📱 START MOBILE CAMERA'}
+                    <button className={`cyber-btn ${deviceCameraActive ? 'secondary' : 'primary'}`} style={{ flex: 1 }} onClick={toggleDeviceCamera}>
+                      {deviceCameraActive ? '⏸️ STOP CAMERA' : '📱 START MOBILE CAMERA'}
                     </button>
-                    <button
-                      className="cyber-btn secondary"
-                      style={{ flex: 1 }}
-                      onClick={scanDeviceCameraFrame}
-                      disabled={!deviceCameraActive || isScanning}
-                    >
-                      {isScanning ? '⏳ SCANNING...' : '🔎 SCAN CURRENT FRAME'}
+                    <button className="cyber-btn secondary" style={{ flex: 1 }} onClick={scanDeviceCameraFrame} disabled={!deviceCameraActive || isScanning || !backendOnline}>
+                      {isScanning ? '⏳ SCANNING…' : '🔎 SCAN FRAME'}
                     </button>
                   </div>
                 </>
               ) : (
                 <>
                   <div className="scanner-viewport">
-                    <img
-                      src={`${API_BASE}/camera/feed`}
-                      alt="Live CCTV Camera Feed"
-                      className="scanner-image-preview"
-                      style={{ maxHeight: 360, width: '100%', background: '#000' }}
-                    />
+                    {backendOnline ? (
+                      <img
+                        src={`${API_BASE}/camera/feed`}
+                        alt="Live CCTV"
+                        className="scanner-image-preview"
+                        style={{ maxHeight: 360, width: '100%', background: '#000' }}
+                      />
+                    ) : (
+                      <div className="dropzone-empty">
+                        <span className="dropzone-icon">📡</span>
+                        <div className="dropzone-text"><h4>Backend Offline</h4><p>Server CCTV stream unavailable</p></div>
+                      </div>
+                    )}
                   </div>
-
-                  <div style={{ display: 'flex', gap: 10 }}>
-                <button
-                  className={`cyber-btn ${cameraActive ? 'secondary' : 'primary'}`}
-                  style={{ flex: 1 }}
-                  onClick={toggleCamera}
-                >
-                  {cameraActive ? '⏸️ PAUSE LIVE DETECTION' : '▶️ START LIVE SCANNING'}
-                </button>
-                  </div>
+                  <button className={`cyber-btn ${cameraActive ? 'secondary' : 'primary'}`} onClick={toggleCamera} disabled={!backendOnline}>
+                    {cameraActive ? '⏸️ PAUSE LIVE DETECTION' : '▶️ START LIVE SCANNING'}
+                  </button>
                 </>
               )}
 
               <div className="telemetry-bar">
-                <span>Source: <strong>{cameraMode === 'device' ? 'MOBILE DEVICE CAMERA' : 'SERVER CCTV STREAM'}</strong></span>
-                <span>
-                  Status: <strong>{cameraMode === 'device' ? (deviceCameraActive ? 'LIVE PREVIEW' : 'STANDBY') : (cameraActive ? 'ACTIVE SCANNING' : 'STANDBY')}</strong>
-                </span>
-                <span>Target FPS: <strong>{cameraMode === 'device' ? 'DEVICE LIVE' : '25 FPS'}</strong></span>
+                <span>Source: <strong>{cameraMode === 'device' ? 'MOBILE DEVICE' : 'SERVER CCTV'}</strong></span>
+                <span>Status: <strong>{cameraMode === 'device' ? (deviceCameraActive ? 'LIVE' : 'STANDBY') : (cameraActive ? 'SCANNING' : 'STANDBY')}</strong></span>
+                <span>Mode: <strong>{detectionMode === 'background_subtraction' ? 'BG-SUB' : 'YOLOv8'}</strong></span>
               </div>
             </>
           )}
         </div>
 
-        {/* RIGHT PANEL: HOLOGRAPHIC 3D PARKING GRID */}
+        {/* RIGHT: PARKING GRID */}
         <div className="panel">
           <div className="panel-header">
             <div className="panel-title">
@@ -690,140 +741,120 @@ export default function App() {
               <h3>FACILITY PARKING BAYS</h3>
             </div>
             <div className="tab-group">
-              <button
-                className={`tab-btn ${sectionFilter === 'ALL' ? 'active' : ''}`}
-                onClick={() => setSectionFilter('ALL')}
-              >
-                ALL
-              </button>
-              <button
-                className={`tab-btn ${sectionFilter === 'A' ? 'active' : ''}`}
-                onClick={() => setSectionFilter('A')}
-              >
-                SEC A
-              </button>
-              <button
-                className={`tab-btn ${sectionFilter === 'B' ? 'active' : ''}`}
-                onClick={() => setSectionFilter('B')}
-              >
-                SEC B
-              </button>
+              <button className={`tab-btn ${sectionFilter === 'ALL' ? 'active' : ''}`} onClick={() => setSectionFilter('ALL')}>ALL</button>
+              {uniqueSections.map((sec) => (
+                <button key={sec} className={`tab-btn ${sectionFilter === sec ? 'active' : ''}`} onClick={() => setSectionFilter(sec)}>
+                  SEC {sec}
+                </button>
+              ))}
             </div>
           </div>
 
-          <div className="parking-grid">
-            {filteredSlots.map((slot) => {
-              const statusClass = slot.status.toLowerCase()
-              return (
-                <div
-                  key={slot.slot_id}
-                  className={`slot-card ${statusClass}`}
-                  onClick={() => {
-                    if (slot.status === 'AVAILABLE') {
-                      setLicensePlate(`VIP-${slot.slot_id}`)
-                    }
-                  }}
-                  title={slot.status === 'AVAILABLE' ? 'Click to Reserve this slot' : 'Occupied'}
-                >
-                  <div className="slot-header">
-                    <span className="slot-id-badge">{slot.slot_id}</span>
-                    <span className="slot-badge">{slot.status}</span>
+          {slots.length === 0 && backendOnline === false ? (
+            <div className="dropzone-empty" style={{ minHeight: 200 }}>
+              <span className="dropzone-icon">📡</span>
+              <div className="dropzone-text">
+                <h4>No bay data</h4>
+                <p>{wakingUp ? 'Waiting for backend…' : 'Backend offline'}</p>
+              </div>
+            </div>
+          ) : (
+            <div className="parking-grid">
+              {filteredSlots.map((slot) => {
+                const statusClass = slot.status.toLowerCase()
+                return (
+                  <div
+                    key={slot.slot_id}
+                    className={`slot-card ${statusClass}`}
+                    onClick={() => { if (slot.status === 'AVAILABLE') setLicensePlate(`VIP-${slot.slot_id}`) }}
+                    title={slot.status === 'AVAILABLE' ? 'Click to pre-fill reservation' : slot.status}
+                  >
+                    <div className="slot-header">
+                      <span className="slot-id-badge">{slot.slot_id}</span>
+                      <span className="slot-badge">{slot.status}</span>
+                    </div>
+                    <div className="slot-visual-center">
+                      {slot.status === 'OCCUPIED' ? (
+                        <span role="img" aria-label="Car" style={{ filter: 'drop-shadow(0 0 10px rgba(255,0,85,0.6))' }}>🏎️</span>
+                      ) : slot.status === 'RESERVED' ? (
+                        <span role="img" aria-label="Reserved">🎫</span>
+                      ) : (
+                        <span role="img" aria-label="Available" style={{ filter: 'drop-shadow(0 0 10px rgba(0,255,157,0.5))' }}>🅿️</span>
+                      )}
+                    </div>
+                    <div className="slot-meta">
+                      <span>{slot.vehicle_id || (slot.status === 'AVAILABLE' ? 'TAP TO RESERVE' : 'IN USE')}</span>
+                      <span>{slot.confidence ? `${Math.round(slot.confidence * 100)}% CONF` : ''}</span>
+                    </div>
                   </div>
-
-                  <div className="slot-visual-center">
-                    {slot.status === 'OCCUPIED' ? (
-                      <span role="img" aria-label="Car" style={{ filter: 'drop-shadow(0 0 10px rgba(255,0,85,0.6))' }}>
-                        🏎️
-                      </span>
-                    ) : slot.status === 'RESERVED' ? (
-                      <span role="img" aria-label="Reserved">
-                        🎫
-                      </span>
-                    ) : (
-                      <span role="img" aria-label="Available" style={{ filter: 'drop-shadow(0 0 10px rgba(0,255,157,0.5))' }}>
-                        🅿️
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="slot-meta">
-                    <span>{slot.vehicle_id || (slot.status === 'AVAILABLE' ? 'TAP TO RESERVE' : 'IN USE')}</span>
-                    <span>{slot.confidence ? `${Math.round(slot.confidence * 100)}% CONF` : '100%'}</span>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
+                )
+              })}
+            </div>
+          )}
         </div>
       </section>
 
-      {/* BOTTOM SECTION: RECENT EVENT STREAM & SYSTEM HEALTH */}
+      {/* BOTTOM: EVENTS + SYSTEM HEALTH */}
       <section className="bottom-grid">
-        {/* RECENT EVENTS */}
         <div className="panel">
           <div className="panel-header">
-            <div className="panel-title">
-              <span>📡</span>
-              <h3>REAL-TIME AUDIT LOG & EVENTS</h3>
-            </div>
+            <div className="panel-title"><span>📡</span><h3>REAL-TIME AUDIT LOG</h3></div>
             <span className="hud-badge">{events.length} LOGGED</span>
           </div>
-
           <ul className="event-list">
             {events.length ? (
-              events
-                .slice()
-                .reverse()
-                .map((ev, idx) => (
-                  <li key={ev.event_id || idx} className="event-item">
-                    <span className="event-time">
-                      {ev.timestamp ? ev.timestamp.slice(11, 19) : 'LIVE'}
-                    </span>
-                    <span className="event-slot">{ev.slot_id}</span>
-                    <span className={`event-status ${ev.status?.toLowerCase()}`}>
-                      {ev.event_type || ev.status}
-                    </span>
-                    <span style={{ color: 'var(--text-muted)' }}>
-                      {ev.vehicle_id ? `[${ev.vehicle_id}]` : `${Math.round((ev.confidence || 0.95) * 100)}%`}
-                    </span>
-                  </li>
-                ))
+              [...events].reverse().map((ev, idx) => (
+                <li key={ev.event_id || idx} className="event-item">
+                  <span className="event-time">{ev.timestamp ? ev.timestamp.slice(11, 19) : 'LIVE'}</span>
+                  <span className="event-slot">{ev.slot_id}</span>
+                  <span className={`event-status ${ev.status?.toLowerCase()}`}>{ev.event_type || ev.status}</span>
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    {ev.vehicle_id ? `[${ev.vehicle_id}]` : `${Math.round((ev.confidence || 0.95) * 100)}%`}
+                  </span>
+                </li>
+              ))
             ) : (
-              <li className="event-item">No security events logged yet</li>
+              <li className="event-item">No events logged yet</li>
             )}
           </ul>
         </div>
 
-        {/* SYSTEM HEALTH */}
         <div className="panel">
           <div className="panel-header">
-            <div className="panel-title">
-              <span>⚙️</span>
-              <h3>SYSTEM TELEMETRY</h3>
-            </div>
-            <span className="status-pill">100% OPERATIONAL</span>
+            <div className="panel-title"><span>⚙️</span><h3>SYSTEM TELEMETRY</h3></div>
+            <span className={`status-pill ${backendOnline ? '' : 'offline'}`}>
+              {backendOnline ? '● ONLINE' : '● OFFLINE'}
+            </span>
           </div>
-
           <div className="health-grid">
             <div className="health-item">
-              <label>AI VISION ENGINE</label>
-              <strong>YOLOv8 NANO (COCO)</strong>
+              <label>DETECTION MODE</label>
+              <strong>{detectionMode === 'background_subtraction' ? 'BG SUBTRACTION' : 'YOLOv8'}</strong>
+            </div>
+            <div className="health-item">
+              <label>BG CALIBRATED</label>
+              <strong style={{ color: bgCalibrated ? 'var(--neon-emerald)' : 'var(--neon-crimson)' }}>
+                {bgCalibrated ? '✅ YES' : '❌ NEEDS SETUP'}
+              </strong>
             </div>
             <div className="health-item">
               <label>OCCUPANCY ENGINE</label>
-              <strong>SPATIAL POLYGON IoU</strong>
+              <strong>POLYGON IoU + BG-SUB</strong>
             </div>
             <div className="health-item">
-              <label>INFERENCE DEVICE</label>
-              <strong>LOCAL CPU (OPTIMIZED)</strong>
-            </div>
-            <div className="health-item">
-              <label>LATENCY</label>
-              <strong style={{ color: 'var(--neon-cyan)' }}>REAL-TIME (&lt;45ms)</strong>
+              <label>LIVE UPDATES</label>
+              <strong style={{ color: wsRef.current?.readyState === 1 ? 'var(--neon-emerald)' : 'var(--text-muted)' }}>
+                {wsRef.current?.readyState === 1 ? 'WEBSOCKET' : 'POLLING'}
+              </strong>
             </div>
           </div>
           <div className="section-list">
-            {sections.map((section) => <div key={section.section_id}><label>Section {section.section_id}</label><span>{section.available}/{section.total} available</span></div>)}
+            {sections.map((section) => (
+              <div key={section.section_id}>
+                <label>Section {section.section_id}</label>
+                <span>{section.available}/{section.total} available</span>
+              </div>
+            ))}
           </div>
         </div>
       </section>
