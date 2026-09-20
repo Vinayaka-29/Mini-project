@@ -265,48 +265,74 @@ async def detect_auto(file: UploadFile = File(...)) -> dict[str, Any]:
     """Auto-calibrate parking bays using Gemini and detect vehicle occupancy with YOLO."""
     image_bytes = await file.read()
 
-    # Run calibration in threadpool to avoid blocking async event loop
     try:
         bays = await run_in_threadpool(calibrate_image, image_bytes, file.content_type or "image/jpeg")
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"Calibration failed: {e}")
+    except Exception as e:
+        logger.error("Unexpected calibration error: %s", e, exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Calibration failed: {type(e).__name__}: {e}")
 
     if not bays:
         return {"bays": [], "vehicles": [], "message": "No parking bays detected in this image."}
 
-    # Decode image for YOLO detection
     def process_detection():
         np_arr = np.frombuffer(image_bytes, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if frame is None:
-            raise ValueError("Could not decode image")
+            raise ValueError("Could not decode image (invalid or corrupted file)")
 
         h, w = frame.shape[:2]
 
-        # Run YOLO detection to find vehicles
         detector = get_detector()
-        detector.set_detection_mode("yolo")  # Force YOLO mode for this endpoint
-        vehicle_detections = detector._detect_yolo(frame, conf_threshold=0.25)
+        detector.set_detection_mode("yolo")
 
-        # Convert vehicle detections to normalized boxes
+        try:
+            vehicle_detections = detector._detect_yolo(frame, conf_threshold=0.25)
+        except TypeError:
+            # Signature might not accept conf_threshold as a kwarg — retry positionally,
+            # then with no confidence arg at all.
+            try:
+                vehicle_detections = detector._detect_yolo(frame, 0.25)
+            except TypeError:
+                vehicle_detections = detector._detect_yolo(frame)
+
         vehicles = []
         for det in vehicle_detections:
-            bbox = det.bbox
-            # Normalize to 0-1
-            norm_box = [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h]
+            # Handle both object-style (det.bbox) and dict-style (det["bbox"]) detections
+            if isinstance(det, dict):
+                bbox = det.get("bbox") or det.get("box")
+                class_name = det.get("class_name") or det.get("class") or det.get("label", "vehicle")
+                confidence = det.get("confidence", 0.0)
+            else:
+                bbox = getattr(det, "bbox", None) or getattr(det, "box", None)
+                class_name = getattr(det, "class_name", None) or getattr(det, "label", "vehicle")
+                confidence = getattr(det, "confidence", 0.0)
+
+            if bbox is None:
+                raise ValueError(f"Could not extract bounding box from detection object: {det!r}")
+
+            # Normalize to 0-1. If values already look normalized (all <= 1.0), leave as-is.
+            if all(0.0 <= v <= 1.0 for v in bbox):
+                norm_box = list(bbox)
+            else:
+                norm_box = [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h]
+
             vehicles.append({
-                "class": det.class_name,
-                "confidence": det.confidence,
+                "class": class_name,
+                "confidence": confidence,
                 "box": norm_box
             })
 
-        # Match bays with vehicles using overlap
         results = []
         for bay in bays:
             bx = bay["box"]
             best_overlap = 0.0
             for v in vehicles:
-                overlap = calculate_box_iou(bx, v["box"])
+                try:
+                    overlap = calculate_box_iou(bx, v["box"])
+                except Exception as e:
+                    raise ValueError(f"calculate_box_iou failed on bay={bx} vehicle={v['box']}: {type(e).__name__}: {e}")
                 best_overlap = max(best_overlap, overlap)
             status = "occupied" if best_overlap >= 0.4 else "free"
             results.append({
@@ -318,4 +344,10 @@ async def detect_auto(file: UploadFile = File(...)) -> dict[str, Any]:
 
         return {"bays": results, "vehicles": vehicles}
 
-    return await run_in_threadpool(process_detection)
+    try:
+        return await run_in_threadpool(process_detection)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Detection failed: {e}")
+    except Exception as e:
+        logger.error("detect_auto pipeline failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Detection failed: {type(e).__name__}: {e}")
