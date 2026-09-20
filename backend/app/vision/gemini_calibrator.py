@@ -2,6 +2,7 @@ import os
 import json
 import re
 import base64
+import time
 import requests
 
 CALIBRATION_PROMPT = """You are a computer vision system that finds parking
@@ -49,9 +50,23 @@ def calibrate_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> list[d
         "generationConfig": {"temperature": 0}
     }
 
-    resp = requests.post(gemini_url, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    # Retry logic for 503 errors
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(gemini_url, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 503 and attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                continue
+            raise ValueError(f"Gemini API error: {e.response.status_code} {e.response.reason}")
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"Network error calling Gemini: {str(e)}")
+    else:
+        raise ValueError("Gemini API unavailable after 3 retries")
 
     try:
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
